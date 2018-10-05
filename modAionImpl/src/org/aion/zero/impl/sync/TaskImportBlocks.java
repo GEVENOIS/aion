@@ -78,7 +78,7 @@ final class TaskImportBlocks implements Runnable {
 
     private final Map<ByteArrayWrapper, Object> importedBlockHashes;
 
-    private final Map<Integer, PeerState> peerStates;
+    private final PeerStateMgr peerStates;
 
     private final Logger log;
 
@@ -91,7 +91,7 @@ final class TaskImportBlocks implements Runnable {
             final SyncStats _stats,
             final BlockingQueue<BlocksWrapper> _downloadedBlocks,
             final Map<ByteArrayWrapper, Object> _importedBlockHashes,
-            final Map<Integer, PeerState> _peerStates,
+            final PeerStateMgr _peerStates,
             final Logger _log) {
         this.chain = _chain;
         this.start = _start;
@@ -118,7 +118,7 @@ final class TaskImportBlocks implements Runnable {
                 return;
             }
 
-            PeerState peerState = peerStates.get(bw.getNodeIdHash());
+            PeerState peerState = peerStates.getForImport(bw.getNodeIdHash());
             if (peerState == null) {
                 // ignoring these blocks
                 log.warn("Peer {} sent blocks that were not requested.", bw.getDisplayId());

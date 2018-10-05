@@ -57,7 +57,7 @@ final class TaskGetHeaders implements Runnable {
 
     private final BigInteger selfTd;
 
-    private final Map<Integer, PeerState> peerStates;
+    private final PeerStateMgr peerStates;
 
     private final Logger log;
 
@@ -67,7 +67,7 @@ final class TaskGetHeaders implements Runnable {
             IP2pMgr p2p,
             long selfNumber,
             BigInteger selfTd,
-            Map<Integer, PeerState> peerStates,
+          PeerStateMgr peerStates,
             Logger log) {
         this.p2p = p2p;
         this.selfNumber = selfNumber;
@@ -109,7 +109,7 @@ final class TaskGetHeaders implements Runnable {
         INode node = nodesFiltered.get(random.nextInt(nodesFiltered.size()));
 
         // fetch the peer state
-        PeerState state = peerStates.get(node.getIdHash());
+        PeerState state = peerStates.getForHeaders(node.getIdHash());
 
         // decide the start block number
         long from = 0;
