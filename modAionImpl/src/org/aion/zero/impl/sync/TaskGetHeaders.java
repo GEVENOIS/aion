@@ -1,32 +1,25 @@
 /*
  * Copyright (c) 2017-2018 Aion foundation.
  *
- * This file is part of the aion network project.
+ *     This file is part of the aion network project.
  *
- * The aion network project is free software: you can redistribute it
- * and/or modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation, either version 3 of
- * the License, or any later version.
+ *     The aion network project is free software: you can redistribute it
+ *     and/or modify it under the terms of the GNU General Public License
+ *     as published by the Free Software Foundation, either version 3 of
+ *     the License, or any later version.
  *
- * The aion network project is distributed in the hope that it will
- * be useful, but WITHOUT ANY WARRANTY; without even the implied
- * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
- * See the GNU General Public License for more details.
+ *     The aion network project is distributed in the hope that it will
+ *     be useful, but WITHOUT ANY WARRANTY; without even the implied
+ *     warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ *     See the GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with the aion network project source files.
- * If not, see <https://www.gnu.org/licenses/>.
+ *     You should have received a copy of the GNU General Public License
+ *     along with the aion network project source files.
+ *     If not, see <https://www.gnu.org/licenses/>.
  *
- * The aion network project leverages useful source code from other
- * open source projects. We greatly appreciate the effort that was
- * invested in these projects and we thank the individual contributors
- * for their work. For provenance information and contributors
- * please see <https://github.com/aionnetwork/aion/wiki/Contributors>.
- *
- * Contributors to the aion source files in decreasing order of code volume:
- * Aion foundation.
+ * Contributors:
+ *     Aion foundation.
  */
-
 package org.aion.zero.impl.sync;
 
 import static org.aion.p2p.P2pConstant.BACKWARD_SYNC_STEP;
@@ -45,6 +38,7 @@ import java.util.Random;
 import java.util.stream.Collectors;
 import org.aion.p2p.INode;
 import org.aion.p2p.IP2pMgr;
+import org.aion.zero.impl.sync.PeerState.State;
 import org.aion.zero.impl.sync.msg.ReqBlocksHeaders;
 import org.slf4j.Logger;
 
@@ -106,10 +100,16 @@ final class TaskGetHeaders implements Runnable {
         }
 
         // pick one random node
-        INode node = nodesFiltered.get(random.nextInt(nodesFiltered.size()));
+        INode node = nodesFiltered.remove(random.nextInt(nodesFiltered.size()));
 
         // fetch the peer state
         PeerState state = peerStates.getForHeaders(node.getIdHash());
+
+        // try again if headers were already requested and more peers are available
+        while (state.getState() == State.HEADERS_REQUESTED && !nodesFiltered.isEmpty()) {
+            node = nodesFiltered.remove(random.nextInt(nodesFiltered.size()));
+            state = peerStates.get(node.getIdHash());
+        }
 
         // decide the start block number
         long from = 0;
