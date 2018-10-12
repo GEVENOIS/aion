@@ -37,19 +37,59 @@
 
 package org.aion.api.server.rpc;
 
+import static java.util.stream.Collectors.toList;
+import static org.aion.base.util.ByteUtil.hexStringToBytes;
+import static org.aion.base.util.ByteUtil.toHexString;
+
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListenableFutureTask;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.math.RoundingMode;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 import org.aion.api.server.ApiAion;
-import org.aion.api.server.types.*;
+import org.aion.api.server.types.ArgFltr;
+import org.aion.api.server.types.ArgTxCall;
+import org.aion.api.server.types.Blk;
+import org.aion.api.server.types.CompiledContr;
+import org.aion.api.server.types.Evt;
+import org.aion.api.server.types.Fltr;
+import org.aion.api.server.types.FltrBlk;
+import org.aion.api.server.types.FltrLg;
+import org.aion.api.server.types.FltrTx;
+import org.aion.api.server.types.NumericalValue;
+import org.aion.api.server.types.SyncInfo;
+import org.aion.api.server.types.Tx;
+import org.aion.api.server.types.TxRecpt;
 import org.aion.base.db.IRepository;
 import org.aion.base.type.Address;
 import org.aion.base.type.Hash256;
 import org.aion.base.type.ITransaction;
 import org.aion.base.type.ITxReceipt;
-import org.aion.base.util.*;
+import org.aion.base.util.ByteArrayWrapper;
+import org.aion.base.util.ByteUtil;
+import org.aion.base.util.FastByteComparisons;
+import org.aion.base.util.TypeConverter;
+import org.aion.base.util.Utils;
 import org.aion.base.vm.IDataWord;
 import org.aion.crypto.ECKey;
 import org.aion.crypto.HashUtil;
@@ -58,7 +98,15 @@ import org.aion.evtmgr.IHandler;
 import org.aion.evtmgr.impl.callback.EventCallback;
 import org.aion.evtmgr.impl.evt.EventTx;
 import org.aion.mcf.account.Keystore;
-import org.aion.mcf.config.*;
+import org.aion.mcf.config.CfgApi;
+import org.aion.mcf.config.CfgApiNrg;
+import org.aion.mcf.config.CfgApiRpc;
+import org.aion.mcf.config.CfgApiZmq;
+import org.aion.mcf.config.CfgNet;
+import org.aion.mcf.config.CfgNetP2p;
+import org.aion.mcf.config.CfgSsl;
+import org.aion.mcf.config.CfgSync;
+import org.aion.mcf.config.CfgTx;
 import org.aion.mcf.core.AccountState;
 import org.aion.mcf.core.ImportResult;
 import org.aion.mcf.vm.types.DataWord;
@@ -85,112 +133,34 @@ import org.apache.commons.collections4.map.LRUMap;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.math.BigDecimal;
-import java.math.BigInteger;
-import java.math.RoundingMode;
-import java.time.Instant;
-import java.time.ZoneOffset;
-import java.util.*;
-import java.util.HashMap;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.function.Function;
-
-import static java.util.stream.Collectors.toList;
-import static org.aion.base.util.ByteUtil.hexStringToBytes;
-import static org.aion.base.util.ByteUtil.toHexString;
-
 /**
  * @author chris lin, ali sharif TODO: make implementation pass all spec tests:
- *     https://github.com/ethereum/rpc-tests
+ * https://github.com/ethereum/rpc-tests
  */
 @SuppressWarnings({"Duplicates", "WeakerAccess"})
 public class ApiWeb3Aion extends ApiAion {
 
+    private final static int BLOCK_CACHE_SIZE = 1000;
+    // default block for pending transactions
+    private static final AionBlock defaultBlock =
+        new AionBlock(new A0BlockHeader.Builder().build(), Collections.emptyList());
     private final int OPS_RECENT_ENTITY_COUNT = 32;
     private final int OPS_RECENT_ENTITY_CACHE_TIME_SECONDS = 4;
-
     private final int STRATUM_RECENT_BLK_COUNT = 128;
     private final int STRATUM_BLKTIME_INCLUDED_COUNT = 32;
     private final int STRATUM_CACHE_TIME_SECONDS = 15;
+    private final LoadingCache<Integer, ChainHeadView> CachedRecentEntities;
+    private final LoadingCache<String, MinerStatsView> MinerStats;
+    private final LoadingCache<ByteArrayWrapper, AionBlock> blockCache;
     // TODO: Verify if need to use a concurrent map; locking may allow for use of a simple map
     private HashMap<ByteArrayWrapper, AionBlock> templateMap;
     private ReadWriteLock templateMapLock;
     private IEventMgr evtMgr;
     // doesn't need to be protected for concurrent access, since only one write in the constructor.
     private boolean isFilterEnabled;
-
     private boolean isSeedMode;
-
     private ExecutorService cacheUpdateExecutor;
-    private final LoadingCache<Integer, ChainHeadView> CachedRecentEntities;
-
     private ExecutorService MinerStatsExecutor;
-    private final LoadingCache<String, MinerStatsView> MinerStats;
-
-    protected void onBlock(AionBlockSummary cbs) {
-        if (isFilterEnabled) {
-            installedFilters
-                    .keySet()
-                    .forEach(
-                            (k) -> {
-                                Fltr f = installedFilters.get(k);
-                                if (f.isExpired()) {
-                                    LOG.debug("<Filter: expired, key={}>", k);
-                                    installedFilters.remove(k);
-                                } else if (f.onBlock(cbs)) {
-                                    LOG.debug(
-                                            "<Filter: append, onBlock type={} blk#={}>",
-                                            f.getType().name(),
-                                            cbs.getBlock().getNumber());
-                                }
-                            });
-        }
-    }
-
-    protected void pendingTxReceived(ITransaction _tx) {
-        if (isFilterEnabled) {
-            // not absolutely neccessary to do eviction on installedFilters here, since we're doing
-            // it already
-            // in the onBlock event. eviction done here "just in case ..."
-            installedFilters
-                    .keySet()
-                    .forEach(
-                            (k) -> {
-                                Fltr f = installedFilters.get(k);
-                                if (f.isExpired()) {
-                                    LOG.debug("<filter expired, key={}>", k);
-                                    installedFilters.remove(k);
-                                } else if (f.onTransaction(_tx)) {
-                                    LOG.info(
-                                            "<filter append, onPendingTransaction fltrSize={} type={} txHash={}>",
-                                            f.getSize(),
-                                            f.getType().name(),
-                                            TypeConverter.toJsonHex(_tx.getHash()));
-                                }
-                            });
-        }
-    }
-
-    protected void pendingTxUpdate(ITxReceipt _txRcpt, EventTx.STATE _state) {
-        // commenting this out because of lack support for old web3 client that we are using
-        // TODO: re-enable this when we upgrade our web3 client
-        /*
-        if (isFilterEnabled) {
-            ByteArrayWrapper txHashW = new ByteArrayWrapper(((AionTxReceipt) _txRcpt).getTransaction().getHash());
-            if (_state.isPending() || _state == EventTx.STATE.DROPPED0) {
-                pendingReceipts.put(txHashW, (AionTxReceipt) _txRcpt);
-            } else {
-                pendingReceipts.remove(txHashW);
-            }
-        }
-        */
-    }
-
-    private final LoadingCache<ByteArrayWrapper, AionBlock> blockCache;
-    private final static int BLOCK_CACHE_SIZE = 1000;
 
     public ApiWeb3Aion(final IAionChain _ac) {
         super(_ac);
@@ -222,1164 +192,67 @@ public class ApiWeb3Aion extends ApiAion {
         // ops-related endpoints
         // https://github.com/google/guava/wiki/CachesExplained#refresh
         CachedRecentEntities = CacheBuilder.newBuilder()
-                .maximumSize(1)
-                .refreshAfterWrite(OPS_RECENT_ENTITY_CACHE_TIME_SECONDS, TimeUnit.SECONDS)
-                .build(
-                    new CacheLoader<>() {
-                        public ChainHeadView load(Integer key) { // no checked exception
-                            return new ChainHeadView(OPS_RECENT_ENTITY_COUNT).update();
-                        }
-
-                        public ListenableFuture<ChainHeadView> reload(final Integer key,
-                            ChainHeadView prev) {
-                            try {
-                                ListenableFutureTask<ChainHeadView> task = ListenableFutureTask
-                                    .create(() -> new ChainHeadView(prev).update());
-                                cacheUpdateExecutor.execute(task);
-                                return task;
-                            } catch (Throwable e) {
-                                LOG.debug("<cache-updater - could not queue up task: ", e);
-                                throw (e);
-                            } // exception is swallowed by refresh and load. so just log it for our logs
-                        }
-                    });
-
-        cacheUpdateExecutor = new ThreadPoolExecutor(1, 1, 10, TimeUnit.SECONDS,
-                new ArrayBlockingQueue<>(1), new CacheUpdateThreadFactory());
-
-        //noinspection NullableProblems
-        blockCache = CacheBuilder.newBuilder().maximumSize(BLOCK_CACHE_SIZE).build(
+            .maximumSize(1)
+            .refreshAfterWrite(OPS_RECENT_ENTITY_CACHE_TIME_SECONDS, TimeUnit.SECONDS)
+            .build(
                 new CacheLoader<>() {
-                    public AionBlock load(ByteArrayWrapper blockHash) {
-                        LOG.debug("<rpc-server blockCache miss for "+blockHash.toString()+" >");
-                        return getBlockByHash(blockHash.getData());
+                    public ChainHeadView load(Integer key) { // no checked exception
+                        return new ChainHeadView(OPS_RECENT_ENTITY_COUNT).update();
+                    }
+
+                    public ListenableFuture<ChainHeadView> reload(final Integer key,
+                        ChainHeadView prev) {
+                        try {
+                            ListenableFutureTask<ChainHeadView> task = ListenableFutureTask
+                                .create(() -> new ChainHeadView(prev).update());
+                            cacheUpdateExecutor.execute(task);
+                            return task;
+                        } catch (Throwable e) {
+                            LOG.debug("<cache-updater - could not queue up task: ", e);
+                            throw (e);
+                        } // exception is swallowed by refresh and load. so just log it for our logs
                     }
                 });
 
-        MinerStats = CacheBuilder.newBuilder()
-                .maximumSize(1)
-                .refreshAfterWrite(STRATUM_CACHE_TIME_SECONDS, TimeUnit.SECONDS)
-                .build(
-                        new CacheLoader<>() {
-                            public MinerStatsView load(String key) { // no checked exception
-                                Address miner = new Address(key);
-                                return new MinerStatsView(STRATUM_RECENT_BLK_COUNT, miner.toBytes()).update();
-                            }
+        cacheUpdateExecutor = new ThreadPoolExecutor(1, 1, 10, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(1), new CacheUpdateThreadFactory());
 
-                            public ListenableFuture<MinerStatsView> reload(final String key, MinerStatsView prev) {
-                                try {
-                                    ListenableFutureTask<MinerStatsView> task = ListenableFutureTask.create(
-                                        () -> new MinerStatsView(prev).update());
-                                    MinerStatsExecutor.execute(task);
-                                    return task;
-                                } catch (Throwable e) {
-                                    LOG.debug("<miner-stats - could not queue up task: ", e);
-                                    throw(e);
-                                } // exception is swallowed by refresh and load. so just log it for our logs
-                            }
-                        });
+        //noinspection NullableProblems
+        blockCache = CacheBuilder.newBuilder().maximumSize(BLOCK_CACHE_SIZE).build(
+            new CacheLoader<>() {
+                public AionBlock load(ByteArrayWrapper blockHash) {
+                    LOG.debug("<rpc-server blockCache miss for " + blockHash.toString() + " >");
+                    return getBlockByHash(blockHash.getData());
+                }
+            });
+
+        MinerStats = CacheBuilder.newBuilder()
+            .maximumSize(1)
+            .refreshAfterWrite(STRATUM_CACHE_TIME_SECONDS, TimeUnit.SECONDS)
+            .build(
+                new CacheLoader<>() {
+                    public MinerStatsView load(String key) { // no checked exception
+                        Address miner = new Address(key);
+                        return new MinerStatsView(STRATUM_RECENT_BLK_COUNT, miner.toBytes())
+                            .update();
+                    }
+
+                    public ListenableFuture<MinerStatsView> reload(final String key,
+                        MinerStatsView prev) {
+                        try {
+                            ListenableFutureTask<MinerStatsView> task = ListenableFutureTask.create(
+                                () -> new MinerStatsView(prev).update());
+                            MinerStatsExecutor.execute(task);
+                            return task;
+                        } catch (Throwable e) {
+                            LOG.debug("<miner-stats - could not queue up task: ", e);
+                            throw (e);
+                        } // exception is swallowed by refresh and load. so just log it for our logs
+                    }
+                });
 
         MinerStatsExecutor = new ThreadPoolExecutor(1, 1, 10, TimeUnit.SECONDS,
-                new ArrayBlockingQueue<>(1), new MinerStatsThreadFactory());
-    }
-
-    // --------------------------------------------------------------------
-    // Mining Pool
-    // --------------------------------------------------------------------
-
-    /* Return a reference to the AIONBlock without converting values to hex
-     * Requied for the mining pool implementation
-     */
-    private AionBlock getBlockRaw(int bn) {
-        // long bn = this.parseBnOrId(_bnOrId);
-        AionBlock nb = this.ac.getBlockchain().getBlockByNumber(bn);
-
-        if (nb == null) {
-            if (LOG.isDebugEnabled()) LOG.debug("<get-block-raw bn={} err=not-found>", bn);
-            return null;
-        } else {
-            return nb;
-        }
-    }
-
-    // --------------------------------------------------------------------
-    // Ethereum-Compliant JSON RPC Specification Implementation
-    // --------------------------------------------------------------------
-
-    public RpcMsg web3_clientVersion() {
-        return new RpcMsg(this.clientVersion);
-    }
-
-    public RpcMsg web3_sha3(Object _params) {
-        String _data;
-        if (_params instanceof JSONArray) {
-            _data = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _data = ((JSONObject) _params).get("data") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        return new RpcMsg(
-                TypeConverter.toJsonHex(HashUtil.keccak256(ByteUtil.hexStringToBytes(_data))));
-    }
-
-    public RpcMsg net_version() {
-        return new RpcMsg(chainId());
-    }
-
-    public RpcMsg net_peerCount() {
-        return new RpcMsg(peerCount());
-    }
-
-    public RpcMsg net_listening() {
-        // currently, p2p manager is always listening for peers and is active
-        return new RpcMsg(true);
-    }
-
-    public RpcMsg eth_protocolVersion() {
-        return new RpcMsg(p2pProtocolVersion());
-    }
-
-    public RpcMsg eth_syncing() {
-        SyncInfo syncInfo = getSync();
-        if (!syncInfo.done) {
-            JSONObject obj = new JSONObject();
-            // create obj for when syncing is completed
-            obj.put(
-                    "startingBlock",
-                    new NumericalValue(syncInfo.chainStartingBlkNumber).toHexString());
-            obj.put("currentBlock", new NumericalValue(syncInfo.chainBestBlkNumber).toHexString());
-            obj.put(
-                    "highestBlock",
-                    new NumericalValue(syncInfo.networkBestBlkNumber).toHexString());
-            return new RpcMsg(obj);
-        } else {
-            // create obj for when syncing is ongoing
-            return new RpcMsg(false);
-        }
-    }
-
-    public RpcMsg eth_coinbase() {
-        return new RpcMsg(getCoinbase());
-    }
-
-    public RpcMsg eth_mining() {
-        return new RpcMsg(isMining());
-    }
-
-    public RpcMsg eth_hashrate() {
-        return new RpcMsg(getHashrate());
-    }
-
-    public RpcMsg eth_submitHashrate(Object _params) {
-        String _hashrate;
-        String _clientId;
-        if (_params instanceof JSONArray) {
-            _hashrate = ((JSONArray) _params).get(0) + "";
-            _clientId = ((JSONArray) _params).get(1) + "";
-        } else if (_params instanceof JSONObject) {
-            _hashrate = ((JSONObject) _params).get("hashrate") + "";
-            _clientId = ((JSONObject) _params).get("clientId") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        return new RpcMsg(setReportedHashrate(_hashrate, _clientId));
-    }
-
-    public RpcMsg eth_gasPrice() {
-        return new RpcMsg(TypeConverter.toJsonHex(getRecommendedNrgPrice()));
-    }
-
-    public RpcMsg eth_accounts() {
-        return new RpcMsg(new JSONArray(getAccounts()));
-    }
-
-    public RpcMsg eth_blockNumber() {
-        return new RpcMsg(getBestBlock().getNumber());
-    }
-
-    public RpcMsg eth_getBalance(Object _params) {
-        String _address;
-        Object _bnOrId;
-
-        if (_params instanceof JSONArray) {
-            _address = ((JSONArray) _params).get(0) + "";
-            _bnOrId = ((JSONArray) _params).opt(1);
-        } else if (_params instanceof JSONObject) {
-            _address = ((JSONObject) _params).get("address") + "";
-            _bnOrId = ((JSONObject) _params).opt("block") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Address address = new Address(_address);
-
-        String bnOrId = "latest";
-        if (!JSONObject.NULL.equals(_bnOrId))
-            bnOrId = _bnOrId + "";
-        /*
-        if (!bnOrId.equalsIgnoreCase("latest")) {
-            return new RpcMsg(
-                    null,
-                    RpcError.INVALID_PARAMS,
-                    "Default block parameter temporarily unsupported");
-        }*/
-
-        IRepository repo = getRepoByJsonBlockId(bnOrId);
-        if (repo == null) // invalid bnOrId
-            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Block not found for id / block number: "+bnOrId+". " +
-                    "State may have been pruned; please check your db pruning settings in the configuration file.");
-
-        //IRepository repo = this.ac.getRepository();
-
-        BigInteger balance = repo.getBalance(address);
-        return new RpcMsg(TypeConverter.toJsonHex(balance));
-    }
-
-    public RpcMsg eth_getStorageAt(Object _params) {
-        String _address;
-        String _index;
-        Object _bnOrId;
-        if (_params instanceof JSONArray) {
-            _address = ((JSONArray) _params).get(0) + "";
-            _index = ((JSONArray) _params).get(1) + "";
-            _bnOrId = ((JSONArray) _params).opt(2);
-        } else if (_params instanceof JSONObject) {
-            _address = ((JSONObject) _params).get("address") + "";
-            _index = ((JSONObject) _params).get("index") + "";
-            _bnOrId = ((JSONObject) _params).opt("block");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Address address = new Address(_address);
-
-        String bnOrId = "latest";
-        if (!JSONObject.NULL.equals(_bnOrId))
-            bnOrId = _bnOrId + "";
-
-        DataWord key;
-
-        try {
-            key = new DataWord(ByteUtil.hexStringToBytes(_index));
-        } catch (Exception e) {
-            // invalid key
-            LOG.debug("eth_getStorageAt: invalid storageIndex. Must be <= 16 bytes.");
-            return new RpcMsg(
-                    null, RpcError.INVALID_PARAMS, "Invalid storageIndex. Must be <= 16 bytes.");
-        }
-        /*
-        if (!bnOrId.equalsIgnoreCase("latest")) {
-            return new RpcMsg(
-                    null,
-                    RpcError.INVALID_PARAMS,
-                    "Default block parameter temporarily unsupported");
-        }*/
-
-        IRepository repo = getRepoByJsonBlockId(bnOrId);
-        if (repo == null) // invalid bnOrId
-            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Block not found for id / block number: "+bnOrId+". " +
-                    "State may have been pruned; please check your db pruning settings in the configuration file.");
-
-        //IRepository repo = this.ac.getRepository();
-
-        @SuppressWarnings("unchecked")
-        IDataWord storageValue = repo.getStorageValue(address, key);
-        if (storageValue != null)
-            return new RpcMsg(TypeConverter.toJsonHex(storageValue.getData()));
-        else return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Storage value not found");
-    }
-
-    public RpcMsg eth_getTransactionCount(Object _params) {
-        String _address;
-        Object _bnOrId;
-        if (_params instanceof JSONArray) {
-            _address = ((JSONArray) _params).get(0) + "";
-            _bnOrId = ((JSONArray) _params).opt(1);
-        } else if (_params instanceof JSONObject) {
-            _address = ((JSONObject) _params).get("address") + "";
-            _bnOrId = ((JSONObject) _params).opt("block");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Address address = new Address(_address);
-
-        String bnOrId = "latest";
-        if (!JSONObject.NULL.equals(_bnOrId))
-            bnOrId = _bnOrId + "";
-        /*
-        if (!bnOrId.equalsIgnoreCase("latest")) {
-            return new RpcMsg(
-                    null,
-                    RpcError.INVALID_PARAMS,
-                    "Default block parameter temporarily unsupported");
-        }*/
-
-        IRepository repo = getRepoByJsonBlockId(bnOrId);
-        if (repo == null) // invalid bnOrId
-            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Block not found for id / block number: "+bnOrId+". " +
-                    "State may have been pruned; please check your db pruning settings in the configuration file.");
-
-        //IRepository repo = this.ac.getRepository();
-
-        return new RpcMsg(TypeConverter.toJsonHex(repo.getNonce(address)));
-    }
-
-    public RpcMsg eth_getBlockTransactionCountByHash(Object _params) {
-        String _hash;
-        if (_params instanceof JSONArray) {
-            _hash = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _hash = ((JSONObject) _params).get("hash") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] hash = ByteUtil.hexStringToBytes(_hash);
-        AionBlock b = this.ac.getBlockchain().getBlockByHash(hash);
-        if (b == null) return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Block not found.");
-
-        long n = b.getTransactionsList().size();
-        return new RpcMsg(TypeConverter.toJsonHex(n));
-    }
-
-    public RpcMsg eth_getBlockTransactionCountByNumber(Object _params) {
-        String _bnOrId;
-        if (_params instanceof JSONArray) {
-            _bnOrId = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _bnOrId = ((JSONObject) _params).get("block") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Long bn = parseBnOrId(_bnOrId);
-        if (bn == null) return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block number.");
-
-        // pending transactions
-        if (bn < 0) {
-            long pendingTxCount = this.ac.getAionHub().getPendingState().getPendingTxSize();
-            return new RpcMsg(TypeConverter.toJsonHex(pendingTxCount));
-        }
-
-        AionBlock b = this.ac.getBlockchain().getBlockByNumber(bn);
-        if (b == null) return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Block not found.");
-
-        List<AionTransaction> list = b.getTransactionsList();
-
-        long n = list.size();
-        return new RpcMsg(TypeConverter.toJsonHex(n));
-    }
-
-    public RpcMsg eth_getCode(Object _params) {
-        String _address;
-        Object _bnOrId;
-        if (_params instanceof JSONArray) {
-            _address = ((JSONArray) _params).get(0) + "";
-            _bnOrId = ((JSONArray) _params).opt(1);
-        } else if (_params instanceof JSONObject) {
-            _address = ((JSONObject) _params).get("address") + "";
-            _bnOrId = ((JSONObject) _params).opt("block");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Address address = new Address(_address);
-
-        String bnOrId = "latest";
-        if (!JSONObject.NULL.equals(_bnOrId))
-            bnOrId = _bnOrId + "";
-        /*
-        if (!bnOrId.equalsIgnoreCase("latest")) {
-            return new RpcMsg(
-                    null,
-                    RpcError.INVALID_PARAMS,
-                    "Default block parameter temporarily unsupported");
-        }*/
-
-        IRepository repo = getRepoByJsonBlockId(bnOrId);
-        if (repo == null) // invalid bnOrId
-            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Block not found for id / block number: "+bnOrId+". " +
-                    "State may have been pruned; please check your db pruning settings in the configuration file.");
-
-        //IRepository repo = this.ac.getRepository();
-
-        byte[] code = repo.getCode(address);
-        return new RpcMsg(TypeConverter.toJsonHex(code));
-    }
-
-    public RpcMsg eth_sign(Object _params) {
-        String _address;
-        String _message;
-        if (_params instanceof JSONArray) {
-            _address = ((JSONArray) _params).get(0) + "";
-            _message = ((JSONArray) _params).get(1) + "";
-        } else if (_params instanceof JSONObject) {
-            _address = ((JSONObject) _params).get("address") + "";
-            _message = ((JSONObject) _params).get("message") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Address address = Address.wrap(_address);
-        ECKey key = getAccountKey(address.toString());
-        if (key == null) return new RpcMsg(null, RpcError.NOT_ALLOWED, "Account not unlocked.");
-
-        // Message starts with Unicode Character 'END OF MEDIUM' (U+0019)
-        String message = "\u0019Aion Signed Message:\n" + _message.length() + _message;
-        byte[] messageHash = HashUtil.keccak256(message.getBytes());
-
-        return new RpcMsg(TypeConverter.toJsonHex(key.sign(messageHash).getSignature()));
-    }
-
-    public RpcMsg eth_sendTransaction(Object _params) {
-        JSONObject _tx;
-        if (_params instanceof JSONArray) {
-            _tx = ((JSONArray) _params).getJSONObject(0);
-        } else if (_params instanceof JSONObject) {
-            _tx = ((JSONObject) _params).getJSONObject("transaction");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        ArgTxCall txParams = ArgTxCall.fromJSON(_tx, getNrgOracle(), getDefaultNrgLimit());
-        if (txParams == null)
-            return new RpcMsg(
-                    null, RpcError.INVALID_PARAMS, "Please check your transaction object.");
-
-        // check for unlocked account
-        Address address = txParams.getFrom();
-        ECKey key = getAccountKey(address.toString());
-
-        if (key == null) return new RpcMsg(null, RpcError.NOT_ALLOWED, "Account not unlocked.");
-
-        byte[] response = sendTransaction(txParams);
-        return new RpcMsg(TypeConverter.toJsonHex(response));
-    }
-
-    public RpcMsg eth_sendRawTransaction(Object _params) {
-        String _rawTx;
-        if (_params instanceof JSONArray) {
-            _rawTx = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _rawTx = ((JSONObject) _params).get("transaction") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        if (_rawTx.equals("null"))
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Null raw transaction provided.");
-
-        byte[] rawTransaction = ByteUtil.hexStringToBytes(_rawTx);
-
-        byte[] transactionHash = sendTransaction(rawTransaction);
-        return new RpcMsg(TypeConverter.toJsonHex(transactionHash));
-    }
-
-    public RpcMsg eth_call(Object _params) {
-        JSONObject _tx;
-        Object _bnOrId;
-        if (_params instanceof JSONArray) {
-            _tx = ((JSONArray) _params).getJSONObject(0);
-            _bnOrId = ((JSONArray) _params).opt(1);
-        } else if (_params instanceof JSONObject) {
-            _tx = ((JSONObject) _params).getJSONObject("transaction");
-            _bnOrId = ((JSONObject) _params).opt("block");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        ArgTxCall txParams = ArgTxCall.fromJSON(_tx, getNrgOracle(), getDefaultNrgLimit());
-
-        if (txParams == null)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid transaction parameter provided");
-
-        String bnOrId = "latest";
-        if (!JSONObject.NULL.equals(_bnOrId))
-            bnOrId = _bnOrId + "";
-
-        Long bn = parseBnOrId(bnOrId);
-        if (bn == null || bn < 0)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block id provided.");
-
-        AionTransaction tx =
-                new AionTransaction(
-                        txParams.getNonce().toByteArray(),
-                        txParams.getTo(),
-                        txParams.getValue().toByteArray(),
-                        txParams.getData(),
-                        txParams.getNrg(),
-                        txParams.getNrgPrice());
-
-        AionBlock b = this.ac.getBlockchain().getBlockByNumber(bn);
-        AionTxReceipt receipt = this.ac.callConstant(tx, b);
-
-        return new RpcMsg(TypeConverter.toJsonHex(receipt.getExecutionResult()));
-    }
-
-    public RpcMsg eth_estimateGas(Object _params) {
-        JSONObject _tx;
-        if (_params instanceof JSONArray) {
-            _tx = ((JSONArray) _params).getJSONObject(0);
-        } else if (_params instanceof JSONObject) {
-            _tx = ((JSONObject) _params).getJSONObject("transaction");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        ArgTxCall txParams = ArgTxCall.fromJSON(_tx, getNrgOracle(), getDefaultNrgLimit());
-        NumericalValue estimate = new NumericalValue(estimateNrg(txParams));
-
-        return new RpcMsg(estimate.toHexString());
-    }
-
-    public RpcMsg eth_getBlockByHash(Object _params) {
-        String _hash;
-        boolean _fullTx;
-        try {
-            if (_params instanceof JSONArray) {
-                _hash = ((JSONArray) _params).get(0) + "";
-                _fullTx = ((JSONArray) _params).optBoolean(1, false);
-            } else if (_params instanceof JSONObject) {
-                _hash = ((JSONObject) _params).get("block") + "";
-                _fullTx = ((JSONObject) _params).optBoolean("fullTransaction", false);
-            } else {
-                throw new Exception("Invalid input object provided");
-            }
-        } catch (Exception e) {
-            LOG.debug("Error processing json input arguments", e);
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] hash = ByteUtil.hexStringToBytes(_hash);
-
-        AionBlock block = this.ac.getBlockchain().getBlockByHash(hash);
-        if (block == null) {
-            LOG.debug("<get-block hash={} err=not-found>", _hash);
-            return new RpcMsg(JSONObject.NULL); // json rpc spec: 'or null when no block was found'
-        }
-
-        byte[] mainchainHash = this.ac.getAionHub().getBlockStore().getBlockHashByNumber(block.getNumber());
-        if (mainchainHash == null) {
-            LOG.debug("<get-block hash={} err=not-found>", _hash);
-            return new RpcMsg(JSONObject.NULL); // json rpc spec: 'or null when no block was found'
-        }
-
-        if (!FastByteComparisons.equal(block.getHash(), mainchainHash)) {
-            LOG.debug("<rpc-server not mainchain>", _hash);
-            return new RpcMsg(JSONObject.NULL);
-        }
-
-        BigInteger totalDiff = this.ac.getAionHub().getBlockStore().getTotalDifficultyForHash(hash);
-        return new RpcMsg(Blk.AionBlockToJson(block, totalDiff, _fullTx));
-    }
-
-    public RpcMsg eth_getBlockByNumber(Object _params) {
-        String _bnOrId;
-        boolean _fullTx;
-        try {
-            if (_params instanceof JSONArray) {
-                _bnOrId = ((JSONArray) _params).get(0) + "";
-                _fullTx = ((JSONArray) _params).optBoolean(1, false);
-            } else if (_params instanceof JSONObject) {
-                _bnOrId = ((JSONObject) _params).get("block") + "";
-                _fullTx = ((JSONObject) _params).optBoolean("fullTransaction", false);
-            } else {
-                throw new Exception("Invalid input object provided");
-            }
-        } catch (Exception e) {
-            LOG.debug("Error processing json input arguments", e);
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Long bn = this.parseBnOrId(_bnOrId);
-
-        if (bn == null || bn < 0)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block id provided.");
-
-        AionBlock nb = this.ac.getBlockchain().getBlockByNumber(bn);
-
-        if (nb == null) {
-            LOG.debug("<get-block bn={} err=not-found>", bn);
-            return new RpcMsg(JSONObject.NULL); // json rpc spec: 'or null when no block was found'
-        }
-
-        // add main chain block to cache (currently only used by ops_getTransactionReceipt_* functions)
-        blockCache.put(new ByteArrayWrapper(nb.getHash()), nb);
-        BigInteger totalDiff = this.ac.getAionHub().getBlockStore().getTotalDifficultyForHash(nb.getHash());
-        return new RpcMsg(Blk.AionBlockToJson(nb, totalDiff, _fullTx));
-    }
-
-    public RpcMsg eth_getTransactionByHash(Object _params) {
-        String _hash;
-        try {
-            if (_params instanceof JSONArray) {
-                _hash = ((JSONArray) _params).get(0) + "";
-            } else if (_params instanceof JSONObject) {
-                _hash = ((JSONObject) _params).get("transactionHash") + "";
-            } else {
-                throw new Exception("Invalid input object provided");
-            }
-        } catch (Exception e) {
-            LOG.debug("Error processing json input arguments", e);
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] txHash = ByteUtil.hexStringToBytes(_hash);
-        if (_hash.equals("null") || txHash == null) return null;
-
-        AionTxInfo txInfo = this.ac.getAionHub().getBlockchain().getTransactionInfo(txHash);
-        if (txInfo == null)
-            return new RpcMsg(JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
-
-        AionBlock b = this.ac.getBlockchain().getBlockByHash(txInfo.getBlockHash());
-        if (b == null) return null; // this is actually an internal error
-
-        return new RpcMsg(Tx.InfoToJSON(txInfo, b));
-    }
-
-    public RpcMsg eth_getTransactionByBlockHashAndIndex(Object _params) {
-        String _hash;
-        String _index;
-        if (_params instanceof JSONArray) {
-            _hash = ((JSONArray) _params).get(0) + "";
-            _index = ((JSONArray) _params).get(1) + "";
-        } else if (_params instanceof JSONObject) {
-            _hash = ((JSONObject) _params).get("blockHash") + "";
-            _index = ((JSONObject) _params).get("index") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] hash = ByteUtil.hexStringToBytes(_hash);
-        if (_hash.equals("null") || hash == null) return null;
-
-        AionBlock b = this.ac.getBlockchain().getBlockByHash(hash);
-        if (b == null)
-            return new RpcMsg(
-                    JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
-
-        List<AionTransaction> txs = b.getTransactionsList();
-
-        int idx = Integer.decode(_index);
-        if (idx >= txs.size())
-            return new RpcMsg(
-                    JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
-
-        return new RpcMsg(Tx.AionTransactionToJSON(txs.get(idx), b, idx));
-    }
-
-    public RpcMsg eth_getTransactionByBlockNumberAndIndex(Object _params) {
-        String _bnOrId;
-        String _index;
-        if (_params instanceof JSONArray) {
-            _bnOrId = ((JSONArray) _params).get(0) + "";
-            _index = ((JSONArray) _params).get(1) + "";
-        } else if (_params instanceof JSONObject) {
-            _bnOrId = ((JSONObject) _params).get("block") + "";
-            _index = ((JSONObject) _params).get("index") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Long bn = parseBnOrId(_bnOrId);
-        if (bn == null || bn < 0) return null;
-
-        AionBlock b = this.ac.getBlockchain().getBlockByNumber(bn);
-        if (b == null)
-            return new RpcMsg(
-                    JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
-
-        List<AionTransaction> txs = b.getTransactionsList();
-
-        int idx = Integer.decode(_index);
-        if (idx >= txs.size())
-            return new RpcMsg(
-                    JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
-
-        return new RpcMsg(Tx.AionTransactionToJSON(txs.get(idx), b, idx));
-    }
-
-    public RpcMsg eth_getTransactionReceipt(Object _params) {
-        String _hash;
-        if (_params instanceof JSONArray) {
-            _hash = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _hash = ((JSONObject) _params).get("hash") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] txHash = TypeConverter.StringHexToByteArray(_hash);
-        TxRecpt r = getTransactionReceipt(txHash);
-
-        // commenting this out because of lack support for old web3 client that we are using
-        // TODO: re-enable this when we upgrade our web3 client
-        /*
-        // if we can't find the receipt on the mainchain, try looking for it in pending receipts cache
-        /*
-        if (r == null) {
-            AionTxReceipt pendingReceipt = pendingReceipts.get(new ByteArrayWrapper(txHash));
-            r = new TxRecpt(pendingReceipt, null, null, null, true);
-        }
-        */
-
-        if (r == null) return new RpcMsg(JSONObject.NULL); // json rpc spec: 'or null when no receipt was found'
-
-        return new RpcMsg(r.toJson());
-    }
-
-    /* -------------------------------------------------------------------------
-     * compiler
-     */
-
-    public RpcMsg eth_getCompilers() {
-        return new RpcMsg(new JSONArray(this.compilers));
-    }
-
-    public RpcMsg eth_compileSolidity(Object _params) {
-        String _contract;
-        if (_params instanceof JSONArray) {
-            _contract = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _contract = ((JSONObject) _params).get("contract") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        @SuppressWarnings("unchecked")
-        Map<String, CompiledContr> compiled = contract_compileSolidity(_contract);
-        JSONObject obj = new JSONObject();
-        for (String key : compiled.keySet()) {
-            CompiledContr cc = compiled.get(key);
-            obj.put(key, cc.toJSON());
-        }
-        return new RpcMsg(obj);
-    }
-
-    /* -------------------------------------------------------------------------
-     * filters
-     */
-
-    /* Web3 Filters Support
-     *
-     * NOTE: newFilter behaviour is ill-defined in the JSON-rpc spec for the following scenarios:
-     * (an explanation of how we resolved these ambiguities follows immediately after)
-     *
-     * newFilter is used to subscribe for filter on transaction logs for transactions with provided address and topics
-     *
-     * role of fromBlock, toBlock fields within context of newFilter, newBlockFilter, newPendingTransactionFilter
-     * (they seem only more pertinent for getLogs)
-     * how we resolve it: populate historical data (best-effort) in the filter response before "installing the filter"
-     * onus on the user to flush the filter of the historical data, before depending on it for up-to-date values.
-     * apart from loading historical data, fromBlock & toBlock are ignored when loading events on filter queue
-     */
-    private FltrLg createFilter(ArgFltr rf) {
-        FltrLg filter = new FltrLg();
-        filter.setTopics(rf.topics);
-        filter.setContractAddress(rf.address);
-
-        Long bnFrom = parseBnOrId(rf.fromBlock);
-        Long bnTo = parseBnOrId(rf.toBlock);
-
-        if (bnFrom == null || bnTo == null || bnFrom == -1 || bnTo == -1) {
-            LOG.debug("jsonrpc - eth_newFilter(): from, to block parse failed");
-            return null;
-        }
-
-        final AionBlock fromBlock = this.ac.getBlockchain().getBlockByNumber(bnFrom);
-        AionBlock toBlock = this.ac.getBlockchain().getBlockByNumber(bnTo);
-
-        if (fromBlock != null) {
-            // need to add historical data
-            // this is our own policy: what to do in this case is not defined in the spec
-            //
-            // policy: add data from earliest to latest, until we can't fill the queue anymore
-            //
-            // caveat: filling up the events-queue with historical data will cause the following
-            // issue:
-            // the user will miss all events generated between the first poll and filter
-            // installation.
-
-            toBlock = toBlock == null ? getBestBlock() : toBlock;
-            for (long i = fromBlock.getNumber(); i <= toBlock.getNumber(); i++) {
-                if (filter.isFull()) break;
-                filter.onBlock(
-                        this.ac.getBlockchain().getBlockByNumber(i),
-                        this.ac.getAionHub().getBlockchain());
-            }
-        }
-
-        return filter;
-    }
-
-    public RpcMsg eth_newFilter(Object _params) {
-        if (!isFilterEnabled) {
-            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
-        }
-
-        JSONObject _filterObj;
-        if (_params instanceof JSONArray) {
-            _filterObj = ((JSONArray) _params).getJSONObject(0);
-        } else if (_params instanceof JSONObject) {
-            _filterObj = ((JSONObject) _params).getJSONObject("filter");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        ArgFltr rf = ArgFltr.fromJSON(_filterObj);
-        if (rf == null)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid filter object provided.");
-
-        FltrLg filter = createFilter(rf);
-        if (filter == null)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid filter object provided.");
-
-        // "install" the filter after populating historical data;
-        // rationale: until the user gets the id back, the user should not expect the filter to be
-        // "installed" anyway.
-        long id = fltrIndex.getAndIncrement();
-        installedFilters.put(id, filter);
-
-        return new RpcMsg(TypeConverter.toJsonHex(id));
-    }
-
-    public RpcMsg eth_newBlockFilter() {
-        if (!isFilterEnabled) {
-            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
-        }
-
-        long id = fltrIndex.getAndIncrement();
-        installedFilters.put(id, new FltrBlk());
-        return new RpcMsg(TypeConverter.toJsonHex(id));
-    }
-
-    public RpcMsg eth_newPendingTransactionFilter() {
-        if (!isFilterEnabled) {
-            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
-        }
-
-        long id = fltrIndex.getAndIncrement();
-        installedFilters.put(id, new FltrTx());
-        return new RpcMsg(TypeConverter.toJsonHex(id));
-    }
-
-    public RpcMsg eth_uninstallFilter(Object _params) {
-        if (!isFilterEnabled) {
-            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
-        }
-
-        String _id;
-        if (_params instanceof JSONArray) {
-            _id = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _id = ((JSONObject) _params).get("id") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        return new RpcMsg(
-                installedFilters.remove(TypeConverter.StringHexToBigInteger(_id).longValue())
-                        != null);
-    }
-
-    private JSONArray buildFilterResponse(Fltr filter) {
-        Object[] events = filter.poll();
-        JSONArray response = new JSONArray();
-        for (Object event : events) {
-            if (event instanceof Evt) {
-                // put the Object we get out of the Evt object in here
-                response.put(((Evt) event).toJSON());
-            }
-        }
-        return response;
-    }
-
-    public RpcMsg eth_getFilterChanges(Object _params) {
-        if (!isFilterEnabled) {
-            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
-        }
-
-        String _id;
-        if (_params instanceof JSONArray) {
-            _id = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _id = ((JSONObject) _params).get("id") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        long id = TypeConverter.StringHexToBigInteger(_id).longValue();
-        Fltr filter = installedFilters.get(id);
-
-        if (filter == null) return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Filter not found.");
-
-        return new RpcMsg(buildFilterResponse(filter));
-    }
-
-    public RpcMsg eth_getLogs(Object _params) {
-        JSONObject _filterObj;
-        if (_params instanceof JSONArray) {
-            _filterObj = ((JSONArray) _params).getJSONObject(0);
-        } else if (_params instanceof JSONObject) {
-            _filterObj = ((JSONObject) _params).getJSONObject("filter");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        ArgFltr rf = ArgFltr.fromJSON(_filterObj);
-        if (rf == null)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid filter object provided.");
-
-        FltrLg filter = createFilter(rf);
-        if (filter == null)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block ids provided.");
-
-        return new RpcMsg(buildFilterResponse(filter));
-    }
-
-    /* -------------------------------------------------------------------------
-     * personal
-     */
-
-    public RpcMsg personal_unlockAccount(Object _params) {
-        String _account;
-        String _password;
-        Object _duration;
-        if (_params instanceof JSONArray) {
-            _account = ((JSONArray) _params).get(0) + "";
-            _password = ((JSONArray) _params).get(1) + "";
-            _duration = ((JSONArray) _params).opt(2);
-        } else if (_params instanceof JSONObject) {
-            _account = ((JSONObject) _params).get("address") + "";
-            _password = ((JSONObject) _params).get("password") + "";
-            _duration = ((JSONObject) _params).opt("duration");
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        int duration = 300;
-        if (!JSONObject.NULL.equals(_duration))
-            duration = new BigInteger(_duration + "").intValueExact();
-
-        return new RpcMsg(unlockAccount(_account, _password, duration));
-    }
-
-    public RpcMsg personal_lockAccount(Object _params) {
-        String _account;
-        String _password;
-        if (_params instanceof JSONArray) {
-            _account = ((JSONArray) _params).get(0) + "";
-            _password = ((JSONArray) _params).get(1) + "";
-        } else if (_params instanceof JSONObject) {
-            _account = ((JSONObject) _params).get("address") + "";
-            _password = ((JSONObject) _params).get("password") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        return new RpcMsg(lockAccount(Address.wrap(_account), _password));
-    }
-
-    public RpcMsg personal_newAccount(Object _params) {
-        String _password;
-        if (_params instanceof JSONArray) {
-            _password = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _password = ((JSONObject) _params).get("password") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        String address = Keystore.create(_password);
-
-        return new RpcMsg(TypeConverter.toJsonHex(address));
-    }
-
-    /* -------------------------------------------------------------------------
-     * debug
-     */
-
-    public RpcMsg debug_getBlocksByNumber(Object _params) {
-        String _bnOrId;
-        boolean _fullTx;
-        if (_params instanceof JSONArray) {
-            _bnOrId = ((JSONArray) _params).get(0) + "";
-            _fullTx = ((JSONArray) _params).optBoolean(1, false);
-        } else if (_params instanceof JSONObject) {
-            _bnOrId = ((JSONObject) _params).get("block") + "";
-            _fullTx = ((JSONObject) _params).optBoolean("fullTransaction", false);
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        Long bn = parseBnOrId(_bnOrId);
-
-        if (bn == null || bn < 0) return null;
-
-        List<Map.Entry<AionBlock, Map.Entry<BigInteger, Boolean>>> blocks =
-                ((AionBlockStore) this.ac.getAionHub().getBlockchain().getBlockStore())
-                        .getBlocksByNumber(bn);
-        if (blocks == null) {
-            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Blocks requested not found.");
-        }
-
-        JSONArray response = new JSONArray();
-        for (Map.Entry<AionBlock, Map.Entry<BigInteger, Boolean>> block : blocks) {
-            JSONObject b =
-                    (JSONObject)
-                            Blk.AionBlockToJson(block.getKey(), block.getValue().getKey(), _fullTx);
-            b.put("mainchain", block.getValue().getValue());
-            response.put(b);
-        }
-        return new RpcMsg(response);
-    }
-
-    /* -------------------------------------------------------------------------
-     * private debugging APIs
-     * Reasoning for not adding this to conventional web3 calls is so
-     * we can freely change the responses without breaking compatibility
-     */
-    public RpcMsg priv_peers() {
-        Map<Integer, INode> activeNodes = this.ac.getAionHub().getP2pMgr().getActiveNodes();
-
-        JSONArray peerList = new JSONArray();
-
-        for (INode node : activeNodes.values()) {
-            JSONObject n = new JSONObject();
-            n.put("idShort", node.getIdShort());
-            n.put("id", new String(node.getId()));
-            n.put("idHash", node.getIdHash());
-            n.put("version", node.getBinaryVersion());
-            n.put("blockNumber", node.getBestBlockNumber());
-            n.put("totalDifficulty", node.getTotalDifficulty());
-
-            JSONObject network = new JSONObject();
-            network.put("remoteAddress", node.getIpStr() + ":" + node.getPort());
-            n.put("network", network);
-            n.put("latestTimestamp", node.getTimestamp());
-
-            // generate a date corresponding to UTC date time (not local)
-            String utcTimestampDate =
-                    Instant.ofEpochMilli(node.getTimestamp()).atOffset(ZoneOffset.UTC).toString();
-            n.put("latestTimestampUTC", utcTimestampDate);
-            n.put("version", node.getBinaryVersion());
-
-            peerList.put(n);
-        }
-        return new RpcMsg(peerList);
-    }
-
-    public RpcMsg priv_p2pConfig() {
-        CfgNetP2p p2p = CfgAion.inst().getNet().getP2p();
-
-        JSONObject obj = new JSONObject();
-        obj.put("localBinding", p2p.getIp() + ":" + p2p.getPort());
-        return new RpcMsg(obj);
-    }
-
-    // default block for pending transactions
-    private static final AionBlock defaultBlock =
-            new AionBlock(new A0BlockHeader.Builder().build(), Collections.emptyList());
-
-    public RpcMsg priv_getPendingTransactions(Object _params) {
-        boolean fullTx = ((JSONArray) _params).optBoolean(0, false);
-        List<AionTransaction> transactions = this.ac.getPendingStateTransactions();
-
-        JSONArray arr = new JSONArray();
-        for (int i = 0; i < transactions.size(); i++) {
-            if (fullTx) {
-                arr.put(Tx.AionTransactionToJSON(transactions.get(i), defaultBlock, i));
-            } else {
-                arr.put(ByteUtil.toHexString(transactions.get(i).getHash()));
-            }
-        }
-        return new RpcMsg(arr);
-    }
-
-    public RpcMsg priv_getPendingSize() {
-        return new RpcMsg(this.ac.getPendingStateTransactions().size());
-    }
-
-    public RpcMsg priv_dumpTransaction(Object _params) {
-        String transactionHash;
-        if (_params instanceof JSONArray) {
-            transactionHash = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            transactionHash = ((JSONObject) _params).get("hash") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] hash = ByteUtil.hexStringToBytes(transactionHash);
-        if (hash == null)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid transaction hash");
-
-        // begin output processing
-        AionTxInfo transaction = this.ac.getAionHub().getBlockchain().getTransactionInfo(hash);
-
-        if (transaction == null) return new RpcMsg(JSONObject.NULL);
-
-        JSONObject tx =
-                Tx.InfoToJSON(
-                        transaction,
-                        this.ac.getBlockchain().getBlockByHash(transaction.getBlockHash()));
-        String raw = ByteUtil.toHexString(transaction.getReceipt().getTransaction().getEncoded());
-
-        JSONObject obj = new JSONObject();
-        obj.put("transaction", tx);
-        obj.put("raw", raw);
-        return new RpcMsg(obj);
-    }
-
-    public RpcMsg priv_dumpBlockByHash(Object _params) {
-        String hashString;
-        if (_params instanceof JSONArray) {
-            hashString = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            hashString = ((JSONObject) _params).get("hash") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] hash = ByteUtil.hexStringToBytes(hashString);
-        if (hash == null) return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block hash");
-
-        AionBlock block = this.ac.getBlockchain().getBlockByHash(hash);
-
-        if (block == null) return new RpcMsg(JSONObject.NULL);
-
-        BigInteger totalDiff = this.ac.getBlockchain().getTotalDifficultyByHash(new Hash256(hash));
-        return new RpcMsg(dumpBlock(block, totalDiff, false));
-    }
-
-    public RpcMsg priv_dumpBlockByNumber(Object _params) {
-        String numberString;
-        if (_params instanceof JSONArray) {
-            numberString = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            numberString = ((JSONObject) _params).get("number") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        // TODO: parse hex
-        long number;
-        try {
-            number = Long.parseLong(numberString);
-        } catch (NumberFormatException e) {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Unable to decode input number");
-        }
-        AionBlock block = this.ac.getBlockchain().getBlockByNumber(number);
-
-        if (block == null) return new RpcMsg(JSONObject.NULL);
-
-        BigInteger totalDiff =
-                this.ac.getBlockchain().getTotalDifficultyByHash(new Hash256(block.getHash()));
-        return new RpcMsg(dumpBlock(block, totalDiff, false));
+            new ArrayBlockingQueue<>(1), new MinerStatsThreadFactory());
     }
 
     private static JSONObject dumpBlock(AionBlock block, BigInteger totalDiff, boolean full) {
@@ -1388,148 +261,6 @@ public class ApiWeb3Aion extends ApiAion {
         obj.put("raw", ByteUtil.toHexString(block.getEncoded()));
         return obj;
     }
-
-    /**
-     * Very short blurb generated about our most important stats, intended for quick digestion and
-     * monitoring tool usage
-     */
-    // TODO
-    public RpcMsg priv_shortStats() {
-        AionBlock block = this.ac.getBlockchain().getBestBlock();
-        Map<Integer, INode> peer = this.ac.getAionHub().getP2pMgr().getActiveNodes();
-
-        // this could be optimized (cached)
-        INode maxPeer = null;
-        for (INode p : peer.values()) {
-            if (maxPeer == null) {
-                maxPeer = p;
-                continue;
-            }
-
-            if (p.getTotalDifficulty().compareTo(maxPeer.getTotalDifficulty()) > 0) maxPeer = p;
-        }
-
-        // basic local configuration
-        CfgAion config = CfgAion.inst();
-
-        JSONObject obj = new JSONObject();
-        obj.put("id", config.getId());
-        obj.put("genesisHash", ByteUtil.toHexString(config.getGenesis().getHash()));
-        obj.put("version", Version.KERNEL_VERSION);
-        obj.put("bootBlock", this.ac.getAionHub().getStartingBlock().getNumber());
-
-        long time = System.currentTimeMillis();
-        obj.put("timestamp", time);
-        obj.put("timestampUTC", Instant.ofEpochMilli(time).atOffset(ZoneOffset.UTC).toString());
-
-        // base.blockchain
-        JSONObject blockchain = new JSONObject();
-        blockchain.put("bestBlockhash", ByteUtil.toHexString(block.getHash()));
-        blockchain.put("bestNumber", block.getNumber());
-        blockchain.put(
-                "totalDifficulty",
-                this.ac.getBlockchain().getTotalDifficultyByHash(new Hash256(block.getHash())));
-        // end
-        obj.put("local", blockchain);
-
-        // base.network
-        JSONObject network = new JSONObject();
-        // remote
-        if (maxPeer != null) {
-            // base.network.best
-            JSONObject remote = new JSONObject();
-            remote.put("id", new String(maxPeer.getId()));
-            remote.put("totalDifficulty", maxPeer.getTotalDifficulty());
-            remote.put("bestNumber", maxPeer.getBestBlockNumber());
-            remote.put("version", maxPeer.getBinaryVersion());
-            remote.put("timestamp", maxPeer.getTimestamp());
-            remote.put(
-                    "timestampUTC",
-                    Instant.ofEpochMilli(maxPeer.getTimestamp())
-                            .atOffset(ZoneOffset.UTC)
-                            .toString());
-            // end
-            network.put("best", remote);
-        }
-
-        // end
-        network.put("peerCount", peer.size());
-        obj.put("network", network);
-
-        return new RpcMsg(obj);
-    }
-
-    /**
-     * This may seem similar to a superset of peers, with the difference being that this should only
-     * contain a subset of peers we are actively syncing from
-     */
-    public RpcMsg priv_syncPeers() {
-        // contract here is we do NOT modify the peerStates in any way
-        Map<Integer, PeerState> peerStates = this.ac.getAionHub().getSyncMgr().getPeerStates();
-
-        // also retrieve nodes from p2p to see if we can piece together a full state
-        Map<Integer, INode> nodeState = this.ac.getAionHub().getP2pMgr().getActiveNodes();
-
-        JSONArray array = new JSONArray();
-        for (Map.Entry<Integer, PeerState> peerState : peerStates.entrySet()) {
-            // begin []
-            JSONObject peerObj = new JSONObject();
-            INode node;
-            if ((node = nodeState.get(peerState.getKey())) != null) {
-                // base[].node
-                JSONObject nodeObj = new JSONObject();
-                nodeObj.put("id", new String(node.getId()));
-                nodeObj.put("totalDifficulty", node.getTotalDifficulty());
-                nodeObj.put("bestNumber", node.getBestBlockNumber());
-                nodeObj.put("version", node.getBinaryVersion());
-                nodeObj.put("timestamp", node.getTimestamp());
-                nodeObj.put(
-                        "timestampUTC",
-                        Instant.ofEpochMilli(node.getTimestamp())
-                                .atOffset(ZoneOffset.UTC)
-                                .toString());
-
-                // end
-                peerObj.put("node", nodeObj);
-            }
-
-            PeerState ps = peerState.getValue();
-            peerObj.put("idHash", peerState.getKey());
-            peerObj.put("lastRequestTimestamp", ps.getLastHeaderRequest());
-            peerObj.put(
-                    "lastRequestTimestampUTC",
-                    Instant.ofEpochMilli(ps.getLastHeaderRequest())
-                            .atOffset(ZoneOffset.UTC)
-                            .toString());
-            peerObj.put("mode", ps.getMode().toString());
-            peerObj.put("base", ps.getBase());
-
-            // end
-            array.put(peerObj);
-        }
-        return new RpcMsg(array);
-    }
-
-    public RpcMsg priv_config() {
-        JSONObject obj = new JSONObject();
-
-        CfgAion config = CfgAion.inst();
-
-        obj.put("id", config.getId());
-        obj.put("basePath", config.getBasePath());
-
-        obj.put("net", configNet());
-        obj.put("consensus", configConsensus());
-        obj.put("sync", configSync());
-        obj.put("api", configApi());
-        obj.put("db", configDb());
-        obj.put("tx", configTx());
-
-        return new RpcMsg(obj);
-    }
-
-    // TODO: we can refactor these in the future to be in
-    // their respective classes, for now put the toJson here
 
     private static JSONObject configNet() {
         CfgNet config = CfgAion.inst().getNet();
@@ -1565,6 +296,10 @@ public class ApiWeb3Aion extends ApiAion {
         return obj;
     }
 
+    // --------------------------------------------------------------------
+    // Mining Pool
+    // --------------------------------------------------------------------
+
     private static JSONObject configConsensus() {
         CfgConsensusPow config = CfgAion.inst().getConsensus();
         JSONObject obj = new JSONObject();
@@ -1586,6 +321,10 @@ public class ApiWeb3Aion extends ApiAion {
         obj.put("energyStrategy", nrgObj);
         return obj;
     }
+
+    // --------------------------------------------------------------------
+    // Ethereum-Compliant JSON RPC Specification Implementation
+    // --------------------------------------------------------------------
 
     private static JSONObject configSync() {
         CfgSync config = CfgAion.inst().getSync();
@@ -1654,6 +393,1372 @@ public class ApiWeb3Aion extends ApiAion {
         return obj;
     }
 
+    protected void onBlock(AionBlockSummary cbs) {
+        if (isFilterEnabled) {
+            installedFilters
+                .keySet()
+                .forEach(
+                    (k) -> {
+                        Fltr f = installedFilters.get(k);
+                        if (f.isExpired()) {
+                            LOG.debug("<Filter: expired, key={}>", k);
+                            installedFilters.remove(k);
+                        } else if (f.onBlock(cbs)) {
+                            LOG.debug(
+                                "<Filter: append, onBlock type={} blk#={}>",
+                                f.getType().name(),
+                                cbs.getBlock().getNumber());
+                        }
+                    });
+        }
+    }
+
+    protected void pendingTxReceived(ITransaction _tx) {
+        if (isFilterEnabled) {
+            // not absolutely neccessary to do eviction on installedFilters here, since we're doing
+            // it already
+            // in the onBlock event. eviction done here "just in case ..."
+            installedFilters
+                .keySet()
+                .forEach(
+                    (k) -> {
+                        Fltr f = installedFilters.get(k);
+                        if (f.isExpired()) {
+                            LOG.debug("<filter expired, key={}>", k);
+                            installedFilters.remove(k);
+                        } else if (f.onTransaction(_tx)) {
+                            LOG.info(
+                                "<filter append, onPendingTransaction fltrSize={} type={} txHash={}>",
+                                f.getSize(),
+                                f.getType().name(),
+                                TypeConverter.toJsonHex(_tx.getHash()));
+                        }
+                    });
+        }
+    }
+
+    protected void pendingTxUpdate(ITxReceipt _txRcpt, EventTx.STATE _state) {
+        // commenting this out because of lack support for old web3 client that we are using
+        // TODO: re-enable this when we upgrade our web3 client
+        /*
+        if (isFilterEnabled) {
+            ByteArrayWrapper txHashW = new ByteArrayWrapper(((AionTxReceipt) _txRcpt).getTransaction().getHash());
+            if (_state.isPending() || _state == EventTx.STATE.DROPPED0) {
+                pendingReceipts.put(txHashW, (AionTxReceipt) _txRcpt);
+            } else {
+                pendingReceipts.remove(txHashW);
+            }
+        }
+        */
+    }
+
+    /* Return a reference to the AIONBlock without converting values to hex
+     * Requied for the mining pool implementation
+     */
+    private AionBlock getBlockRaw(int bn) {
+        // long bn = this.parseBnOrId(_bnOrId);
+        AionBlock nb = this.ac.getBlockchain().getBlockByNumber(bn);
+
+        if (nb == null) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("<get-block-raw bn={} err=not-found>", bn);
+            }
+            return null;
+        } else {
+            return nb;
+        }
+    }
+
+    public RpcMsg web3_clientVersion() {
+        return new RpcMsg(this.clientVersion);
+    }
+
+    public RpcMsg web3_sha3(Object _params) {
+        String _data;
+        if (_params instanceof JSONArray) {
+            _data = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _data = ((JSONObject) _params).get("data") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        return new RpcMsg(
+            TypeConverter.toJsonHex(HashUtil.keccak256(ByteUtil.hexStringToBytes(_data))));
+    }
+
+    public RpcMsg net_version() {
+        return new RpcMsg(chainId());
+    }
+
+    public RpcMsg net_peerCount() {
+        return new RpcMsg(peerCount());
+    }
+
+    public RpcMsg net_listening() {
+        // currently, p2p manager is always listening for peers and is active
+        return new RpcMsg(true);
+    }
+
+    public RpcMsg eth_protocolVersion() {
+        return new RpcMsg(p2pProtocolVersion());
+    }
+
+    public RpcMsg eth_syncing() {
+        SyncInfo syncInfo = getSync();
+        if (!syncInfo.done) {
+            JSONObject obj = new JSONObject();
+            // create obj for when syncing is completed
+            obj.put(
+                "startingBlock",
+                new NumericalValue(syncInfo.chainStartingBlkNumber).toHexString());
+            obj.put("currentBlock", new NumericalValue(syncInfo.chainBestBlkNumber).toHexString());
+            obj.put(
+                "highestBlock",
+                new NumericalValue(syncInfo.networkBestBlkNumber).toHexString());
+            return new RpcMsg(obj);
+        } else {
+            // create obj for when syncing is ongoing
+            return new RpcMsg(false);
+        }
+    }
+
+    public RpcMsg eth_coinbase() {
+        return new RpcMsg(getCoinbase());
+    }
+
+    public RpcMsg eth_mining() {
+        return new RpcMsg(isMining());
+    }
+
+    public RpcMsg eth_hashrate() {
+        return new RpcMsg(getHashrate());
+    }
+
+    public RpcMsg eth_submitHashrate(Object _params) {
+        String _hashrate;
+        String _clientId;
+        if (_params instanceof JSONArray) {
+            _hashrate = ((JSONArray) _params).get(0) + "";
+            _clientId = ((JSONArray) _params).get(1) + "";
+        } else if (_params instanceof JSONObject) {
+            _hashrate = ((JSONObject) _params).get("hashrate") + "";
+            _clientId = ((JSONObject) _params).get("clientId") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        return new RpcMsg(setReportedHashrate(_hashrate, _clientId));
+    }
+
+    public RpcMsg eth_gasPrice() {
+        return new RpcMsg(TypeConverter.toJsonHex(getRecommendedNrgPrice()));
+    }
+
+    public RpcMsg eth_accounts() {
+        return new RpcMsg(new JSONArray(getAccounts()));
+    }
+
+    public RpcMsg eth_blockNumber() {
+        return new RpcMsg(getBestBlock().getNumber());
+    }
+
+    public RpcMsg eth_getBalance(Object _params) {
+        String _address;
+        Object _bnOrId;
+
+        if (_params instanceof JSONArray) {
+            _address = ((JSONArray) _params).get(0) + "";
+            _bnOrId = ((JSONArray) _params).opt(1);
+        } else if (_params instanceof JSONObject) {
+            _address = ((JSONObject) _params).get("address") + "";
+            _bnOrId = ((JSONObject) _params).opt("block") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Address address = new Address(_address);
+
+        String bnOrId = "latest";
+        if (!JSONObject.NULL.equals(_bnOrId)) {
+            bnOrId = _bnOrId + "";
+        }
+        /*
+        if (!bnOrId.equalsIgnoreCase("latest")) {
+            return new RpcMsg(
+                    null,
+                    RpcError.INVALID_PARAMS,
+                    "Default block parameter temporarily unsupported");
+        }*/
+
+        IRepository repo = getRepoByJsonBlockId(bnOrId);
+        if (repo == null) // invalid bnOrId
+        {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR,
+                "Block not found for id / block number: " + bnOrId + ". " +
+                    "State may have been pruned; please check your db pruning settings in the configuration file.");
+        }
+
+        //IRepository repo = this.ac.getRepository();
+
+        BigInteger balance = repo.getBalance(address);
+        return new RpcMsg(TypeConverter.toJsonHex(balance));
+    }
+
+    public RpcMsg eth_getStorageAt(Object _params) {
+        String _address;
+        String _index;
+        Object _bnOrId;
+        if (_params instanceof JSONArray) {
+            _address = ((JSONArray) _params).get(0) + "";
+            _index = ((JSONArray) _params).get(1) + "";
+            _bnOrId = ((JSONArray) _params).opt(2);
+        } else if (_params instanceof JSONObject) {
+            _address = ((JSONObject) _params).get("address") + "";
+            _index = ((JSONObject) _params).get("index") + "";
+            _bnOrId = ((JSONObject) _params).opt("block");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Address address = new Address(_address);
+
+        String bnOrId = "latest";
+        if (!JSONObject.NULL.equals(_bnOrId)) {
+            bnOrId = _bnOrId + "";
+        }
+
+        DataWord key;
+
+        try {
+            key = new DataWord(ByteUtil.hexStringToBytes(_index));
+        } catch (Exception e) {
+            // invalid key
+            LOG.debug("eth_getStorageAt: invalid storageIndex. Must be <= 16 bytes.");
+            return new RpcMsg(
+                null, RpcError.INVALID_PARAMS, "Invalid storageIndex. Must be <= 16 bytes.");
+        }
+        /*
+        if (!bnOrId.equalsIgnoreCase("latest")) {
+            return new RpcMsg(
+                    null,
+                    RpcError.INVALID_PARAMS,
+                    "Default block parameter temporarily unsupported");
+        }*/
+
+        IRepository repo = getRepoByJsonBlockId(bnOrId);
+        if (repo == null) // invalid bnOrId
+        {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR,
+                "Block not found for id / block number: " + bnOrId + ". " +
+                    "State may have been pruned; please check your db pruning settings in the configuration file.");
+        }
+
+        //IRepository repo = this.ac.getRepository();
+
+        @SuppressWarnings("unchecked")
+        IDataWord storageValue = repo.getStorageValue(address, key);
+        if (storageValue != null) {
+            return new RpcMsg(TypeConverter.toJsonHex(storageValue.getData()));
+        } else {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Storage value not found");
+        }
+    }
+
+    public RpcMsg eth_getTransactionCount(Object _params) {
+        String _address;
+        Object _bnOrId;
+        if (_params instanceof JSONArray) {
+            _address = ((JSONArray) _params).get(0) + "";
+            _bnOrId = ((JSONArray) _params).opt(1);
+        } else if (_params instanceof JSONObject) {
+            _address = ((JSONObject) _params).get("address") + "";
+            _bnOrId = ((JSONObject) _params).opt("block");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Address address = new Address(_address);
+
+        String bnOrId = "latest";
+        if (!JSONObject.NULL.equals(_bnOrId)) {
+            bnOrId = _bnOrId + "";
+        }
+        /*
+        if (!bnOrId.equalsIgnoreCase("latest")) {
+            return new RpcMsg(
+                    null,
+                    RpcError.INVALID_PARAMS,
+                    "Default block parameter temporarily unsupported");
+        }*/
+
+        IRepository repo = getRepoByJsonBlockId(bnOrId);
+        if (repo == null) // invalid bnOrId
+        {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR,
+                "Block not found for id / block number: " + bnOrId + ". " +
+                    "State may have been pruned; please check your db pruning settings in the configuration file.");
+        }
+
+        //IRepository repo = this.ac.getRepository();
+
+        return new RpcMsg(TypeConverter.toJsonHex(repo.getNonce(address)));
+    }
+
+    public RpcMsg eth_getBlockTransactionCountByHash(Object _params) {
+        String _hash;
+        if (_params instanceof JSONArray) {
+            _hash = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _hash = ((JSONObject) _params).get("hash") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] hash = ByteUtil.hexStringToBytes(_hash);
+        AionBlock b = this.ac.getBlockchain().getBlockByHash(hash);
+        if (b == null) {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Block not found.");
+        }
+
+        long n = b.getTransactionsList().size();
+        return new RpcMsg(TypeConverter.toJsonHex(n));
+    }
+
+    public RpcMsg eth_getBlockTransactionCountByNumber(Object _params) {
+        String _bnOrId;
+        if (_params instanceof JSONArray) {
+            _bnOrId = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _bnOrId = ((JSONObject) _params).get("block") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Long bn = parseBnOrId(_bnOrId);
+        if (bn == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block number.");
+        }
+
+        // pending transactions
+        if (bn < 0) {
+            long pendingTxCount = this.ac.getAionHub().getPendingState().getPendingTxSize();
+            return new RpcMsg(TypeConverter.toJsonHex(pendingTxCount));
+        }
+
+        AionBlock b = this.ac.getBlockchain().getBlockByNumber(bn);
+        if (b == null) {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Block not found.");
+        }
+
+        List<AionTransaction> list = b.getTransactionsList();
+
+        long n = list.size();
+        return new RpcMsg(TypeConverter.toJsonHex(n));
+    }
+
+    public RpcMsg eth_getCode(Object _params) {
+        String _address;
+        Object _bnOrId;
+        if (_params instanceof JSONArray) {
+            _address = ((JSONArray) _params).get(0) + "";
+            _bnOrId = ((JSONArray) _params).opt(1);
+        } else if (_params instanceof JSONObject) {
+            _address = ((JSONObject) _params).get("address") + "";
+            _bnOrId = ((JSONObject) _params).opt("block");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Address address = new Address(_address);
+
+        String bnOrId = "latest";
+        if (!JSONObject.NULL.equals(_bnOrId)) {
+            bnOrId = _bnOrId + "";
+        }
+        /*
+        if (!bnOrId.equalsIgnoreCase("latest")) {
+            return new RpcMsg(
+                    null,
+                    RpcError.INVALID_PARAMS,
+                    "Default block parameter temporarily unsupported");
+        }*/
+
+        IRepository repo = getRepoByJsonBlockId(bnOrId);
+        if (repo == null) // invalid bnOrId
+        {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR,
+                "Block not found for id / block number: " + bnOrId + ". " +
+                    "State may have been pruned; please check your db pruning settings in the configuration file.");
+        }
+
+        //IRepository repo = this.ac.getRepository();
+
+        byte[] code = repo.getCode(address);
+        return new RpcMsg(TypeConverter.toJsonHex(code));
+    }
+
+    public RpcMsg eth_sign(Object _params) {
+        String _address;
+        String _message;
+        if (_params instanceof JSONArray) {
+            _address = ((JSONArray) _params).get(0) + "";
+            _message = ((JSONArray) _params).get(1) + "";
+        } else if (_params instanceof JSONObject) {
+            _address = ((JSONObject) _params).get("address") + "";
+            _message = ((JSONObject) _params).get("message") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Address address = Address.wrap(_address);
+        ECKey key = getAccountKey(address.toString());
+        if (key == null) {
+            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Account not unlocked.");
+        }
+
+        // Message starts with Unicode Character 'END OF MEDIUM' (U+0019)
+        String message = "\u0019Aion Signed Message:\n" + _message.length() + _message;
+        byte[] messageHash = HashUtil.keccak256(message.getBytes());
+
+        return new RpcMsg(TypeConverter.toJsonHex(key.sign(messageHash).getSignature()));
+    }
+
+    public RpcMsg eth_sendTransaction(Object _params) {
+        JSONObject _tx;
+        if (_params instanceof JSONArray) {
+            _tx = ((JSONArray) _params).getJSONObject(0);
+        } else if (_params instanceof JSONObject) {
+            _tx = ((JSONObject) _params).getJSONObject("transaction");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        ArgTxCall txParams = ArgTxCall.fromJSON(_tx, getNrgOracle(), getDefaultNrgLimit());
+        if (txParams == null) {
+            return new RpcMsg(
+                null, RpcError.INVALID_PARAMS, "Please check your transaction object.");
+        }
+
+        // check for unlocked account
+        Address address = txParams.getFrom();
+        ECKey key = getAccountKey(address.toString());
+
+        if (key == null) {
+            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Account not unlocked.");
+        }
+
+        byte[] response = sendTransaction(txParams);
+        return new RpcMsg(TypeConverter.toJsonHex(response));
+    }
+
+    public RpcMsg eth_sendRawTransaction(Object _params) {
+        String _rawTx;
+        if (_params instanceof JSONArray) {
+            _rawTx = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _rawTx = ((JSONObject) _params).get("transaction") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        if (_rawTx.equals("null")) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Null raw transaction provided.");
+        }
+
+        byte[] rawTransaction = ByteUtil.hexStringToBytes(_rawTx);
+
+        byte[] transactionHash = sendTransaction(rawTransaction);
+        return new RpcMsg(TypeConverter.toJsonHex(transactionHash));
+    }
+
+    /* -------------------------------------------------------------------------
+     * compiler
+     */
+
+    public RpcMsg eth_call(Object _params) {
+        JSONObject _tx;
+        Object _bnOrId;
+        if (_params instanceof JSONArray) {
+            _tx = ((JSONArray) _params).getJSONObject(0);
+            _bnOrId = ((JSONArray) _params).opt(1);
+        } else if (_params instanceof JSONObject) {
+            _tx = ((JSONObject) _params).getJSONObject("transaction");
+            _bnOrId = ((JSONObject) _params).opt("block");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        ArgTxCall txParams = ArgTxCall.fromJSON(_tx, getNrgOracle(), getDefaultNrgLimit());
+
+        if (txParams == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS,
+                "Invalid transaction parameter provided");
+        }
+
+        String bnOrId = "latest";
+        if (!JSONObject.NULL.equals(_bnOrId)) {
+            bnOrId = _bnOrId + "";
+        }
+
+        Long bn = parseBnOrId(bnOrId);
+        if (bn == null || bn < 0) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block id provided.");
+        }
+
+        AionTransaction tx =
+            new AionTransaction(
+                txParams.getNonce().toByteArray(),
+                txParams.getTo(),
+                txParams.getValue().toByteArray(),
+                txParams.getData(),
+                txParams.getNrg(),
+                txParams.getNrgPrice());
+
+        AionBlock b = this.ac.getBlockchain().getBlockByNumber(bn);
+        AionTxReceipt receipt = this.ac.callConstant(tx, b);
+
+        return new RpcMsg(TypeConverter.toJsonHex(receipt.getExecutionResult()));
+    }
+
+    public RpcMsg eth_estimateGas(Object _params) {
+        JSONObject _tx;
+        if (_params instanceof JSONArray) {
+            _tx = ((JSONArray) _params).getJSONObject(0);
+        } else if (_params instanceof JSONObject) {
+            _tx = ((JSONObject) _params).getJSONObject("transaction");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        ArgTxCall txParams = ArgTxCall.fromJSON(_tx, getNrgOracle(), getDefaultNrgLimit());
+        NumericalValue estimate = new NumericalValue(estimateNrg(txParams));
+
+        return new RpcMsg(estimate.toHexString());
+    }
+
+    /* -------------------------------------------------------------------------
+     * filters
+     */
+
+    public RpcMsg eth_getBlockByHash(Object _params) {
+        String _hash;
+        boolean _fullTx;
+        try {
+            if (_params instanceof JSONArray) {
+                _hash = ((JSONArray) _params).get(0) + "";
+                _fullTx = ((JSONArray) _params).optBoolean(1, false);
+            } else if (_params instanceof JSONObject) {
+                _hash = ((JSONObject) _params).get("block") + "";
+                _fullTx = ((JSONObject) _params).optBoolean("fullTransaction", false);
+            } else {
+                throw new Exception("Invalid input object provided");
+            }
+        } catch (Exception e) {
+            LOG.debug("Error processing json input arguments", e);
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] hash = ByteUtil.hexStringToBytes(_hash);
+
+        AionBlock block = this.ac.getBlockchain().getBlockByHash(hash);
+        if (block == null) {
+            LOG.debug("<get-block hash={} err=not-found>", _hash);
+            return new RpcMsg(JSONObject.NULL); // json rpc spec: 'or null when no block was found'
+        }
+
+        byte[] mainchainHash = this.ac.getAionHub().getBlockStore()
+            .getBlockHashByNumber(block.getNumber());
+        if (mainchainHash == null) {
+            LOG.debug("<get-block hash={} err=not-found>", _hash);
+            return new RpcMsg(JSONObject.NULL); // json rpc spec: 'or null when no block was found'
+        }
+
+        if (!FastByteComparisons.equal(block.getHash(), mainchainHash)) {
+            LOG.debug("<rpc-server not mainchain>", _hash);
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        BigInteger totalDiff = this.ac.getAionHub().getBlockStore().getTotalDifficultyForHash(hash);
+        return new RpcMsg(Blk.AionBlockToJson(block, totalDiff, _fullTx));
+    }
+
+    public RpcMsg eth_getBlockByNumber(Object _params) {
+        String _bnOrId;
+        boolean _fullTx;
+        try {
+            if (_params instanceof JSONArray) {
+                _bnOrId = ((JSONArray) _params).get(0) + "";
+                _fullTx = ((JSONArray) _params).optBoolean(1, false);
+            } else if (_params instanceof JSONObject) {
+                _bnOrId = ((JSONObject) _params).get("block") + "";
+                _fullTx = ((JSONObject) _params).optBoolean("fullTransaction", false);
+            } else {
+                throw new Exception("Invalid input object provided");
+            }
+        } catch (Exception e) {
+            LOG.debug("Error processing json input arguments", e);
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Long bn = this.parseBnOrId(_bnOrId);
+
+        if (bn == null || bn < 0) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block id provided.");
+        }
+
+        AionBlock nb = this.ac.getBlockchain().getBlockByNumber(bn);
+
+        if (nb == null) {
+            LOG.debug("<get-block bn={} err=not-found>", bn);
+            return new RpcMsg(JSONObject.NULL); // json rpc spec: 'or null when no block was found'
+        }
+
+        // add main chain block to cache (currently only used by ops_getTransactionReceipt_* functions)
+        blockCache.put(new ByteArrayWrapper(nb.getHash()), nb);
+        BigInteger totalDiff = this.ac.getAionHub().getBlockStore()
+            .getTotalDifficultyForHash(nb.getHash());
+        return new RpcMsg(Blk.AionBlockToJson(nb, totalDiff, _fullTx));
+    }
+
+    public RpcMsg eth_getTransactionByHash(Object _params) {
+        String _hash;
+        try {
+            if (_params instanceof JSONArray) {
+                _hash = ((JSONArray) _params).get(0) + "";
+            } else if (_params instanceof JSONObject) {
+                _hash = ((JSONObject) _params).get("transactionHash") + "";
+            } else {
+                throw new Exception("Invalid input object provided");
+            }
+        } catch (Exception e) {
+            LOG.debug("Error processing json input arguments", e);
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] txHash = ByteUtil.hexStringToBytes(_hash);
+        if (_hash.equals("null") || txHash == null) {
+            return null;
+        }
+
+        AionTxInfo txInfo = this.ac.getAionHub().getBlockchain().getTransactionInfo(txHash);
+        if (txInfo == null) {
+            return new RpcMsg(
+                JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
+        }
+
+        AionBlock b = this.ac.getBlockchain().getBlockByHash(txInfo.getBlockHash());
+        if (b == null) {
+            return null; // this is actually an internal error
+        }
+
+        return new RpcMsg(Tx.InfoToJSON(txInfo, b));
+    }
+
+    public RpcMsg eth_getTransactionByBlockHashAndIndex(Object _params) {
+        String _hash;
+        String _index;
+        if (_params instanceof JSONArray) {
+            _hash = ((JSONArray) _params).get(0) + "";
+            _index = ((JSONArray) _params).get(1) + "";
+        } else if (_params instanceof JSONObject) {
+            _hash = ((JSONObject) _params).get("blockHash") + "";
+            _index = ((JSONObject) _params).get("index") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] hash = ByteUtil.hexStringToBytes(_hash);
+        if (_hash.equals("null") || hash == null) {
+            return null;
+        }
+
+        AionBlock b = this.ac.getBlockchain().getBlockByHash(hash);
+        if (b == null) {
+            return new RpcMsg(
+                JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
+        }
+
+        List<AionTransaction> txs = b.getTransactionsList();
+
+        int idx = Integer.decode(_index);
+        if (idx >= txs.size()) {
+            return new RpcMsg(
+                JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
+        }
+
+        return new RpcMsg(Tx.AionTransactionToJSON(txs.get(idx), b, idx));
+    }
+
+    public RpcMsg eth_getTransactionByBlockNumberAndIndex(Object _params) {
+        String _bnOrId;
+        String _index;
+        if (_params instanceof JSONArray) {
+            _bnOrId = ((JSONArray) _params).get(0) + "";
+            _index = ((JSONArray) _params).get(1) + "";
+        } else if (_params instanceof JSONObject) {
+            _bnOrId = ((JSONObject) _params).get("block") + "";
+            _index = ((JSONObject) _params).get("index") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Long bn = parseBnOrId(_bnOrId);
+        if (bn == null || bn < 0) {
+            return null;
+        }
+
+        AionBlock b = this.ac.getBlockchain().getBlockByNumber(bn);
+        if (b == null) {
+            return new RpcMsg(
+                JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
+        }
+
+        List<AionTransaction> txs = b.getTransactionsList();
+
+        int idx = Integer.decode(_index);
+        if (idx >= txs.size()) {
+            return new RpcMsg(
+                JSONObject.NULL); // json rpc spec: 'or null when no transaction was found'
+        }
+
+        return new RpcMsg(Tx.AionTransactionToJSON(txs.get(idx), b, idx));
+    }
+
+    public RpcMsg eth_getTransactionReceipt(Object _params) {
+        String _hash;
+        if (_params instanceof JSONArray) {
+            _hash = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _hash = ((JSONObject) _params).get("hash") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] txHash = TypeConverter.StringHexToByteArray(_hash);
+        TxRecpt r = getTransactionReceipt(txHash);
+
+        // commenting this out because of lack support for old web3 client that we are using
+        // TODO: re-enable this when we upgrade our web3 client
+        /*
+        // if we can't find the receipt on the mainchain, try looking for it in pending receipts cache
+        /*
+        if (r == null) {
+            AionTxReceipt pendingReceipt = pendingReceipts.get(new ByteArrayWrapper(txHash));
+            r = new TxRecpt(pendingReceipt, null, null, null, true);
+        }
+        */
+
+        if (r == null) {
+            return new RpcMsg(
+                JSONObject.NULL); // json rpc spec: 'or null when no receipt was found'
+        }
+
+        return new RpcMsg(r.toJson());
+    }
+
+    public RpcMsg eth_getCompilers() {
+        return new RpcMsg(new JSONArray(this.compilers));
+    }
+
+    public RpcMsg eth_compileSolidity(Object _params) {
+        String _contract;
+        if (_params instanceof JSONArray) {
+            _contract = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _contract = ((JSONObject) _params).get("contract") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        @SuppressWarnings("unchecked")
+        Map<String, CompiledContr> compiled = contract_compileSolidity(_contract);
+        JSONObject obj = new JSONObject();
+        for (String key : compiled.keySet()) {
+            CompiledContr cc = compiled.get(key);
+            obj.put(key, cc.toJSON());
+        }
+        return new RpcMsg(obj);
+    }
+
+    /* -------------------------------------------------------------------------
+     * personal
+     */
+
+    /* Web3 Filters Support
+     *
+     * NOTE: newFilter behaviour is ill-defined in the JSON-rpc spec for the following scenarios:
+     * (an explanation of how we resolved these ambiguities follows immediately after)
+     *
+     * newFilter is used to subscribe for filter on transaction logs for transactions with provided address and topics
+     *
+     * role of fromBlock, toBlock fields within context of newFilter, newBlockFilter, newPendingTransactionFilter
+     * (they seem only more pertinent for getLogs)
+     * how we resolve it: populate historical data (best-effort) in the filter response before "installing the filter"
+     * onus on the user to flush the filter of the historical data, before depending on it for up-to-date values.
+     * apart from loading historical data, fromBlock & toBlock are ignored when loading events on filter queue
+     */
+    private FltrLg createFilter(ArgFltr rf) {
+        FltrLg filter = new FltrLg();
+        filter.setTopics(rf.topics);
+        filter.setContractAddress(rf.address);
+
+        Long bnFrom = parseBnOrId(rf.fromBlock);
+        Long bnTo = parseBnOrId(rf.toBlock);
+
+        if (bnFrom == null || bnTo == null || bnFrom == -1 || bnTo == -1) {
+            LOG.debug("jsonrpc - eth_newFilter(): from, to block parse failed");
+            return null;
+        }
+
+        final AionBlock fromBlock = this.ac.getBlockchain().getBlockByNumber(bnFrom);
+        AionBlock toBlock = this.ac.getBlockchain().getBlockByNumber(bnTo);
+
+        if (fromBlock != null) {
+            // need to add historical data
+            // this is our own policy: what to do in this case is not defined in the spec
+            //
+            // policy: add data from earliest to latest, until we can't fill the queue anymore
+            //
+            // caveat: filling up the events-queue with historical data will cause the following
+            // issue:
+            // the user will miss all events generated between the first poll and filter
+            // installation.
+
+            toBlock = toBlock == null ? getBestBlock() : toBlock;
+            for (long i = fromBlock.getNumber(); i <= toBlock.getNumber(); i++) {
+                if (filter.isFull()) {
+                    break;
+                }
+                filter.onBlock(
+                    this.ac.getBlockchain().getBlockByNumber(i),
+                    this.ac.getAionHub().getBlockchain());
+            }
+        }
+
+        return filter;
+    }
+
+    public RpcMsg eth_newFilter(Object _params) {
+        if (!isFilterEnabled) {
+            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
+        }
+
+        JSONObject _filterObj;
+        if (_params instanceof JSONArray) {
+            _filterObj = ((JSONArray) _params).getJSONObject(0);
+        } else if (_params instanceof JSONObject) {
+            _filterObj = ((JSONObject) _params).getJSONObject("filter");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        ArgFltr rf = ArgFltr.fromJSON(_filterObj);
+        if (rf == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid filter object provided.");
+        }
+
+        FltrLg filter = createFilter(rf);
+        if (filter == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid filter object provided.");
+        }
+
+        // "install" the filter after populating historical data;
+        // rationale: until the user gets the id back, the user should not expect the filter to be
+        // "installed" anyway.
+        long id = fltrIndex.getAndIncrement();
+        installedFilters.put(id, filter);
+
+        return new RpcMsg(TypeConverter.toJsonHex(id));
+    }
+
+    public RpcMsg eth_newBlockFilter() {
+        if (!isFilterEnabled) {
+            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
+        }
+
+        long id = fltrIndex.getAndIncrement();
+        installedFilters.put(id, new FltrBlk());
+        return new RpcMsg(TypeConverter.toJsonHex(id));
+    }
+
+    /* -------------------------------------------------------------------------
+     * debug
+     */
+
+    public RpcMsg eth_newPendingTransactionFilter() {
+        if (!isFilterEnabled) {
+            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
+        }
+
+        long id = fltrIndex.getAndIncrement();
+        installedFilters.put(id, new FltrTx());
+        return new RpcMsg(TypeConverter.toJsonHex(id));
+    }
+
+    public RpcMsg eth_uninstallFilter(Object _params) {
+        if (!isFilterEnabled) {
+            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
+        }
+
+        String _id;
+        if (_params instanceof JSONArray) {
+            _id = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _id = ((JSONObject) _params).get("id") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        return new RpcMsg(
+            installedFilters.remove(TypeConverter.StringHexToBigInteger(_id).longValue())
+                != null);
+    }
+
+    private JSONArray buildFilterResponse(Fltr filter) {
+        Object[] events = filter.poll();
+        JSONArray response = new JSONArray();
+        for (Object event : events) {
+            if (event instanceof Evt) {
+                // put the Object we get out of the Evt object in here
+                response.put(((Evt) event).toJSON());
+            }
+        }
+        return response;
+    }
+
+    public RpcMsg eth_getFilterChanges(Object _params) {
+        if (!isFilterEnabled) {
+            return new RpcMsg(null, RpcError.NOT_ALLOWED, "Filters over rpc disabled.");
+        }
+
+        String _id;
+        if (_params instanceof JSONArray) {
+            _id = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _id = ((JSONObject) _params).get("id") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        long id = TypeConverter.StringHexToBigInteger(_id).longValue();
+        Fltr filter = installedFilters.get(id);
+
+        if (filter == null) {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Filter not found.");
+        }
+
+        return new RpcMsg(buildFilterResponse(filter));
+    }
+
+    public RpcMsg eth_getLogs(Object _params) {
+        JSONObject _filterObj;
+        if (_params instanceof JSONArray) {
+            _filterObj = ((JSONArray) _params).getJSONObject(0);
+        } else if (_params instanceof JSONObject) {
+            _filterObj = ((JSONObject) _params).getJSONObject("filter");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        ArgFltr rf = ArgFltr.fromJSON(_filterObj);
+        if (rf == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid filter object provided.");
+        }
+
+        FltrLg filter = createFilter(rf);
+        if (filter == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block ids provided.");
+        }
+
+        return new RpcMsg(buildFilterResponse(filter));
+    }
+
+    public RpcMsg personal_unlockAccount(Object _params) {
+        String _account;
+        String _password;
+        Object _duration;
+        if (_params instanceof JSONArray) {
+            _account = ((JSONArray) _params).get(0) + "";
+            _password = ((JSONArray) _params).get(1) + "";
+            _duration = ((JSONArray) _params).opt(2);
+        } else if (_params instanceof JSONObject) {
+            _account = ((JSONObject) _params).get("address") + "";
+            _password = ((JSONObject) _params).get("password") + "";
+            _duration = ((JSONObject) _params).opt("duration");
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        int duration = 300;
+        if (!JSONObject.NULL.equals(_duration)) {
+            duration = new BigInteger(_duration + "").intValueExact();
+        }
+
+        return new RpcMsg(unlockAccount(_account, _password, duration));
+    }
+
+    public RpcMsg personal_lockAccount(Object _params) {
+        String _account;
+        String _password;
+        if (_params instanceof JSONArray) {
+            _account = ((JSONArray) _params).get(0) + "";
+            _password = ((JSONArray) _params).get(1) + "";
+        } else if (_params instanceof JSONObject) {
+            _account = ((JSONObject) _params).get("address") + "";
+            _password = ((JSONObject) _params).get("password") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        return new RpcMsg(lockAccount(Address.wrap(_account), _password));
+    }
+
+    public RpcMsg personal_newAccount(Object _params) {
+        String _password;
+        if (_params instanceof JSONArray) {
+            _password = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _password = ((JSONObject) _params).get("password") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        String address = Keystore.create(_password);
+
+        return new RpcMsg(TypeConverter.toJsonHex(address));
+    }
+
+    public RpcMsg debug_getBlocksByNumber(Object _params) {
+        String _bnOrId;
+        boolean _fullTx;
+        if (_params instanceof JSONArray) {
+            _bnOrId = ((JSONArray) _params).get(0) + "";
+            _fullTx = ((JSONArray) _params).optBoolean(1, false);
+        } else if (_params instanceof JSONObject) {
+            _bnOrId = ((JSONObject) _params).get("block") + "";
+            _fullTx = ((JSONObject) _params).optBoolean("fullTransaction", false);
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        Long bn = parseBnOrId(_bnOrId);
+
+        if (bn == null || bn < 0) {
+            return null;
+        }
+
+        List<Map.Entry<AionBlock, Map.Entry<BigInteger, Boolean>>> blocks =
+            ((AionBlockStore) this.ac.getAionHub().getBlockchain().getBlockStore())
+                .getBlocksByNumber(bn);
+        if (blocks == null) {
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Blocks requested not found.");
+        }
+
+        JSONArray response = new JSONArray();
+        for (Map.Entry<AionBlock, Map.Entry<BigInteger, Boolean>> block : blocks) {
+            JSONObject b =
+                (JSONObject)
+                    Blk.AionBlockToJson(block.getKey(), block.getValue().getKey(), _fullTx);
+            b.put("mainchain", block.getValue().getValue());
+            response.put(b);
+        }
+        return new RpcMsg(response);
+    }
+
+    /* -------------------------------------------------------------------------
+     * private debugging APIs
+     * Reasoning for not adding this to conventional web3 calls is so
+     * we can freely change the responses without breaking compatibility
+     */
+    public RpcMsg priv_peers() {
+        Map<Integer, INode> activeNodes = this.ac.getAionHub().getP2pMgr().getActiveNodes();
+
+        JSONArray peerList = new JSONArray();
+
+        for (INode node : activeNodes.values()) {
+            JSONObject n = new JSONObject();
+            n.put("idShort", node.getIdShort());
+            n.put("id", new String(node.getId()));
+            n.put("idHash", node.getIdHash());
+            n.put("version", node.getBinaryVersion());
+            n.put("blockNumber", node.getBestBlockNumber());
+            n.put("totalDifficulty", node.getTotalDifficulty());
+
+            JSONObject network = new JSONObject();
+            network.put("remoteAddress", node.getIpStr() + ":" + node.getPort());
+            n.put("network", network);
+            n.put("latestTimestamp", node.getTimestamp());
+
+            // generate a date corresponding to UTC date time (not local)
+            String utcTimestampDate =
+                Instant.ofEpochMilli(node.getTimestamp()).atOffset(ZoneOffset.UTC).toString();
+            n.put("latestTimestampUTC", utcTimestampDate);
+            n.put("version", node.getBinaryVersion());
+
+            peerList.put(n);
+        }
+        return new RpcMsg(peerList);
+    }
+
+    public RpcMsg priv_p2pConfig() {
+        CfgNetP2p p2p = CfgAion.inst().getNet().getP2p();
+
+        JSONObject obj = new JSONObject();
+        obj.put("localBinding", p2p.getIp() + ":" + p2p.getPort());
+        return new RpcMsg(obj);
+    }
+
+    public RpcMsg priv_getPendingTransactions(Object _params) {
+        boolean fullTx = ((JSONArray) _params).optBoolean(0, false);
+        List<AionTransaction> transactions = this.ac.getPendingStateTransactions();
+
+        JSONArray arr = new JSONArray();
+        for (int i = 0; i < transactions.size(); i++) {
+            if (fullTx) {
+                arr.put(Tx.AionTransactionToJSON(transactions.get(i), defaultBlock, i));
+            } else {
+                arr.put(ByteUtil.toHexString(transactions.get(i).getHash()));
+            }
+        }
+        return new RpcMsg(arr);
+    }
+
+    public RpcMsg priv_getPendingSize() {
+        return new RpcMsg(this.ac.getPendingStateTransactions().size());
+    }
+
+    // TODO: we can refactor these in the future to be in
+    // their respective classes, for now put the toJson here
+
+    public RpcMsg priv_dumpTransaction(Object _params) {
+        String transactionHash;
+        if (_params instanceof JSONArray) {
+            transactionHash = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            transactionHash = ((JSONObject) _params).get("hash") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] hash = ByteUtil.hexStringToBytes(transactionHash);
+        if (hash == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid transaction hash");
+        }
+
+        // begin output processing
+        AionTxInfo transaction = this.ac.getAionHub().getBlockchain().getTransactionInfo(hash);
+
+        if (transaction == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        JSONObject tx =
+            Tx.InfoToJSON(
+                transaction,
+                this.ac.getBlockchain().getBlockByHash(transaction.getBlockHash()));
+        String raw = ByteUtil.toHexString(transaction.getReceipt().getTransaction().getEncoded());
+
+        JSONObject obj = new JSONObject();
+        obj.put("transaction", tx);
+        obj.put("raw", raw);
+        return new RpcMsg(obj);
+    }
+
+    public RpcMsg priv_dumpBlockByHash(Object _params) {
+        String hashString;
+        if (_params instanceof JSONArray) {
+            hashString = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            hashString = ((JSONObject) _params).get("hash") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] hash = ByteUtil.hexStringToBytes(hashString);
+        if (hash == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid block hash");
+        }
+
+        AionBlock block = this.ac.getBlockchain().getBlockByHash(hash);
+
+        if (block == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        BigInteger totalDiff = this.ac.getBlockchain().getTotalDifficultyByHash(new Hash256(hash));
+        return new RpcMsg(dumpBlock(block, totalDiff, false));
+    }
+
+    public RpcMsg priv_dumpBlockByNumber(Object _params) {
+        String numberString;
+        if (_params instanceof JSONArray) {
+            numberString = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            numberString = ((JSONObject) _params).get("number") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        // TODO: parse hex
+        long number;
+        try {
+            number = Long.parseLong(numberString);
+        } catch (NumberFormatException e) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Unable to decode input number");
+        }
+        AionBlock block = this.ac.getBlockchain().getBlockByNumber(number);
+
+        if (block == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        BigInteger totalDiff =
+            this.ac.getBlockchain().getTotalDifficultyByHash(new Hash256(block.getHash()));
+        return new RpcMsg(dumpBlock(block, totalDiff, false));
+    }
+
+    /**
+     * Very short blurb generated about our most important stats, intended for quick digestion and
+     * monitoring tool usage
+     */
+    // TODO
+    public RpcMsg priv_shortStats() {
+        AionBlock block = this.ac.getBlockchain().getBestBlock();
+        Map<Integer, INode> peer = this.ac.getAionHub().getP2pMgr().getActiveNodes();
+
+        // this could be optimized (cached)
+        INode maxPeer = null;
+        for (INode p : peer.values()) {
+            if (maxPeer == null) {
+                maxPeer = p;
+                continue;
+            }
+
+            if (p.getTotalDifficulty().compareTo(maxPeer.getTotalDifficulty()) > 0) {
+                maxPeer = p;
+            }
+        }
+
+        // basic local configuration
+        CfgAion config = CfgAion.inst();
+
+        JSONObject obj = new JSONObject();
+        obj.put("id", config.getId());
+        obj.put("genesisHash", ByteUtil.toHexString(config.getGenesis().getHash()));
+        obj.put("version", Version.KERNEL_VERSION);
+        obj.put("bootBlock", this.ac.getAionHub().getStartingBlock().getNumber());
+
+        long time = System.currentTimeMillis();
+        obj.put("timestamp", time);
+        obj.put("timestampUTC", Instant.ofEpochMilli(time).atOffset(ZoneOffset.UTC).toString());
+
+        // base.blockchain
+        JSONObject blockchain = new JSONObject();
+        blockchain.put("bestBlockhash", ByteUtil.toHexString(block.getHash()));
+        blockchain.put("bestNumber", block.getNumber());
+        blockchain.put(
+            "totalDifficulty",
+            this.ac.getBlockchain().getTotalDifficultyByHash(new Hash256(block.getHash())));
+        // end
+        obj.put("local", blockchain);
+
+        // base.network
+        JSONObject network = new JSONObject();
+        // remote
+        if (maxPeer != null) {
+            // base.network.best
+            JSONObject remote = new JSONObject();
+            remote.put("id", new String(maxPeer.getId()));
+            remote.put("totalDifficulty", maxPeer.getTotalDifficulty());
+            remote.put("bestNumber", maxPeer.getBestBlockNumber());
+            remote.put("version", maxPeer.getBinaryVersion());
+            remote.put("timestamp", maxPeer.getTimestamp());
+            remote.put(
+                "timestampUTC",
+                Instant.ofEpochMilli(maxPeer.getTimestamp())
+                    .atOffset(ZoneOffset.UTC)
+                    .toString());
+            // end
+            network.put("best", remote);
+        }
+
+        // end
+        network.put("peerCount", peer.size());
+        obj.put("network", network);
+
+        return new RpcMsg(obj);
+    }
+
+    /**
+     * This may seem similar to a superset of peers, with the difference being that this should only
+     * contain a subset of peers we are actively syncing from
+     */
+    public RpcMsg priv_syncPeers() {
+        // contract here is we do NOT modify the peerStates in any way
+        Map<Integer, PeerState> peerStates = this.ac.getAionHub().getSyncMgr().getPeerStates();
+
+        // also retrieve nodes from p2p to see if we can piece together a full state
+        Map<Integer, INode> nodeState = this.ac.getAionHub().getP2pMgr().getActiveNodes();
+
+        JSONArray array = new JSONArray();
+        for (Map.Entry<Integer, PeerState> peerState : peerStates.entrySet()) {
+            // begin []
+            JSONObject peerObj = new JSONObject();
+            INode node;
+            if ((node = nodeState.get(peerState.getKey())) != null) {
+                // base[].node
+                JSONObject nodeObj = new JSONObject();
+                nodeObj.put("id", new String(node.getId()));
+                nodeObj.put("totalDifficulty", node.getTotalDifficulty());
+                nodeObj.put("bestNumber", node.getBestBlockNumber());
+                nodeObj.put("version", node.getBinaryVersion());
+                nodeObj.put("timestamp", node.getTimestamp());
+                nodeObj.put(
+                    "timestampUTC",
+                    Instant.ofEpochMilli(node.getTimestamp())
+                        .atOffset(ZoneOffset.UTC)
+                        .toString());
+
+                // end
+                peerObj.put("node", nodeObj);
+            }
+
+            PeerState ps = peerState.getValue();
+            peerObj.put("idHash", peerState.getKey());
+            peerObj.put("lastRequestTimestamp", ps.getLastHeaderRequest());
+            peerObj.put(
+                "lastRequestTimestampUTC",
+                Instant.ofEpochMilli(ps.getLastHeaderRequest())
+                    .atOffset(ZoneOffset.UTC)
+                    .toString());
+            peerObj.put("mode", ps.getMode().toString());
+            peerObj.put("base", ps.getBase());
+
+            // end
+            array.put(peerObj);
+        }
+        return new RpcMsg(array);
+    }
+
+    public RpcMsg priv_config() {
+        JSONObject obj = new JSONObject();
+
+        CfgAion config = CfgAion.inst();
+
+        obj.put("id", config.getId());
+        obj.put("basePath", config.getBasePath());
+
+        obj.put("net", configNet());
+        obj.put("consensus", configConsensus());
+        obj.put("sync", configSync());
+        obj.put("api", configApi());
+        obj.put("db", configDb());
+        obj.put("tx", configTx());
+
+        return new RpcMsg(obj);
+    }
+
     /* -------------------------------------------------------------------------
      * operational api
      */
@@ -1679,7 +1784,7 @@ public class ApiWeb3Aion extends ApiAion {
 
         long latestBlkNum = this.getBestBlock().getNumber();
         AccountState accountState =
-                ((AionRepositoryImpl) this.ac.getRepository()).getAccountState(address);
+            ((AionRepositoryImpl) this.ac.getRepository()).getAccountState(address);
 
         BigInteger nonce = BigInteger.ZERO;
         BigInteger balance = BigInteger.ZERO;
@@ -1698,8 +1803,609 @@ public class ApiWeb3Aion extends ApiAion {
         return new RpcMsg(response);
     }
 
+    public RpcMsg ops_getChainHeadView() {
+        try {
+            ChainHeadView v = CachedRecentEntities.get(CachedResponseType.CHAIN_HEAD.ordinal());
+            return new RpcMsg(v.getResponse());
+        } catch (Exception e) {
+            LOG.error("<rpc-server - cannot get cached response for ops_getChainHeadView: ", e);
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Cached response retrieve failed.");
+        }
+    }
+
+    public RpcMsg ops_getChainHeadViewBestBlock() {
+        try {
+            ChainHeadView v = CachedRecentEntities.get(CachedResponseType.CHAIN_HEAD.ordinal());
+            return new RpcMsg(v.getViewBestBlock());
+        } catch (Exception e) {
+            LOG.error("<rpc-server - cannot get cached response for ops_getChainHeadView: ", e);
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Cached response retrieve failed.");
+        }
+    }
+
+    // use a custom implementation to get a receipt with 2 db reads and a constant time op, as opposed to
+    // the getTransactionReceipt() in parent, which computes cumulativeNrg computatio for spec compliance
+    public RpcMsg ops_getTransaction(Object _params) {
+        String _hash;
+        if (_params instanceof JSONArray) {
+            _hash = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _hash = ((JSONObject) _params).get("hash") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] txHash = TypeConverter.StringHexToByteArray(_hash);
+
+        if (txHash == null) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        AionTxInfo txInfo = this.ac.getAionHub().getBlockchain().getTransactionInfo(txHash);
+
+        if (txInfo == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        AionBlock block =
+            this.ac.getAionHub().getBlockchain().getBlockByHash(txInfo.getBlockHash());
+
+        if (block == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        AionTransaction tx = txInfo.getReceipt().getTransaction();
+
+        if (tx == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        JSONObject result = new JSONObject();
+        result.put("timestampVal", block.getTimestamp());
+        result.put("transactionHash", TypeConverter.toJsonHex(tx.getHash()));
+        result.put("blockNumber", block.getNumber());
+        result.put("blockHash", TypeConverter.toJsonHex(block.getHash()));
+        result.put("nonce", TypeConverter.toJsonHex(tx.getNonce()));
+        result.put("fromAddr", TypeConverter.toJsonHex(tx.getFrom().toBytes()));
+        result.put("toAddr", TypeConverter.toJsonHex(tx.getTo().toBytes()));
+        result.put("value", TypeConverter.toJsonHex(tx.getValue()));
+        result.put("nrgPrice", tx.getNrgPrice());
+        result.put("nrgConsumed", txInfo.getReceipt().getEnergyUsed());
+        result.put("data", TypeConverter.toJsonHex(tx.getData()));
+        result.put("transactionIndex", txInfo.getIndex());
+
+        JSONArray logs = new JSONArray();
+        for (Log l : txInfo.getReceipt().getLogInfoList()) {
+            JSONObject log = new JSONObject();
+            log.put("address", l.getAddress().toString());
+            log.put("data", TypeConverter.toJsonHex(l.getData()));
+            JSONArray topics = new JSONArray();
+            for (byte[] topic : l.getTopics()) {
+                topics.put(TypeConverter.toJsonHex(topic));
+            }
+            log.put("topics", topics);
+            logs.put(log);
+        }
+        result.put("logs", logs);
+
+        return new RpcMsg(result);
+    }
+
+    public RpcMsg ops_getBlock(Object _params) {
+        String _bnOrHash;
+        boolean _fullTx;
+        if (_params instanceof JSONArray) {
+            _bnOrHash = ((JSONArray) _params).get(0) + "";
+            _fullTx = ((JSONArray) _params).optBoolean(1, false);
+        } else if (_params instanceof JSONObject) {
+            _bnOrHash = ((JSONObject) _params).get("block") + "";
+            _fullTx = ((JSONObject) _params).optBoolean("fullTransaction", false);
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        AionBlock block = null;
+
+        Long bn = this.parseBnOrId(_bnOrHash);
+
+        // user passed a Long block number
+        if (bn != null) {
+            if (bn >= 0) {
+                block = this.ac.getBlockchain().getBlockByNumber(bn);
+                if (block == null) {
+                    return new RpcMsg(JSONObject.NULL);
+                }
+            } else {
+                return new RpcMsg(JSONObject.NULL);
+            }
+        }
+
+        // see if the user passed in a hash
+        if (block == null) {
+            block = this.ac.getBlockchain().getBlockByHash(ByteUtil.hexStringToBytes(_bnOrHash));
+            if (block == null) {
+                return new RpcMsg(JSONObject.NULL);
+            }
+        }
+
+        AionBlock mainBlock = this.ac.getBlockchain().getBlockByNumber(block.getNumber());
+        if (mainBlock == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        if (!FastByteComparisons.equal(block.getHash(), mainBlock.getHash())) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        // ok so now we have a mainchain block
+
+        BigInteger blkReward =
+            ((AionBlockchainImpl) ac.getBlockchain())
+                .getChainConfiguration()
+                .getRewardsCalculator()
+                .calculateReward(block.getHeader());
+        BigInteger totalDiff =
+            this.ac.getAionHub().getBlockStore().getTotalDifficultyForHash(block.getHash());
+
+        JSONObject blk = new JSONObject();
+        blk.put("timestampVal", block.getTimestamp());
+        blk.put("blockNumber", block.getNumber());
+        blk.put("numTransactions", block.getTransactionsList().size());
+
+        blk.put("blockHash", TypeConverter.toJsonHex(block.getHash()));
+        blk.put("parentHash", TypeConverter.toJsonHex(block.getParentHash()));
+        blk.put("minerAddress", TypeConverter.toJsonHex(block.getCoinbase().toBytes()));
+
+        blk.put("receiptTxRoot", TypeConverter.toJsonHex(block.getReceiptsRoot()));
+        blk.put("txTrieRoot", TypeConverter.toJsonHex(block.getTxTrieRoot()));
+        blk.put("stateRoot", TypeConverter.toJsonHex(block.getStateRoot()));
+
+        blk.put("difficulty", TypeConverter.toJsonHex(block.getDifficulty()));
+        blk.put("totalDifficulty", totalDiff.toString(16));
+        blk.put("nonce", TypeConverter.toJsonHex(block.getNonce()));
+
+        blk.put("blockReward", blkReward);
+        blk.put("nrgConsumed", block.getNrgConsumed());
+        blk.put("nrgLimit", block.getNrgLimit());
+
+        blk.put("size", block.size());
+        blk.put("bloom", TypeConverter.toJsonHex(block.getLogBloom()));
+        blk.put("extraData", TypeConverter.toJsonHex(block.getExtraData()));
+        blk.put("solution", TypeConverter.toJsonHex(block.getHeader().getSolution()));
+
+        JSONObject result = new JSONObject();
+        result.put("blk", blk);
+
+        if (_fullTx) {
+            JSONArray txn = new JSONArray();
+            for (AionTransaction tx : block.getTransactionsList()) {
+                // transactionHash, fromAddr, toAddr, value, timestampVal, blockNumber, blockHash
+                JSONArray t = new JSONArray();
+                t.put(TypeConverter.toJsonHex(tx.getHash()));
+                t.put(TypeConverter.toJsonHex(tx.getFrom().toBytes()));
+                t.put(TypeConverter.toJsonHex(tx.getTo().toBytes()));
+                t.put(TypeConverter.toJsonHex(tx.getValue()));
+                t.put(block.getTimestamp());
+                t.put(block.getNumber());
+
+                txn.put(t);
+            }
+            result.put("txn", txn);
+        }
+
+        return new RpcMsg(result);
+    }
+
+    /**
+     * This function runs in ~ 30ms Is an order of magnitude slower than
+     * ops_getTransactionReceiptByTransactionAndBlockHash
+     */
+    public RpcMsg ops_getTransactionReceiptByTransactionHash(Object _params) {
+        String _transactionHash;
+        if (_params instanceof JSONArray) {
+            _transactionHash = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _transactionHash = ((JSONObject) _params).get("transactionHash") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] transactionHash = TypeConverter.StringHexToByteArray(_transactionHash);
+
+        AionTxInfo info = this.ac.getAionHub().getBlockchain().getTransactionInfo(transactionHash);
+        if (info == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        // ok to getUnchecked() since the load() implementation does not throw checked exceptions
+        AionBlock block = blockCache.getUnchecked(new ByteArrayWrapper(info.getBlockHash()));
+
+        return new RpcMsg((new TxRecpt(block, info, 0L, true)).toJson());
+    }
+
+    /**
+     * This function runs as fast as is possible with the on-disk data model Use this to retrieve
+     * the Transaction Receipt if you know the block hash already
+     */
+    public RpcMsg ops_getTransactionReceiptByTransactionAndBlockHash(Object _params) {
+        String _transactionHash;
+        String _blockHash;
+        if (_params instanceof JSONArray) {
+            _transactionHash = ((JSONArray) _params).get(0) + "";
+            _blockHash = ((JSONArray) _params).get(1) + "";
+        } else if (_params instanceof JSONObject) {
+            _transactionHash = ((JSONObject) _params).get("transactionHash") + "";
+            _blockHash = ((JSONObject) _params).get("blockHash") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] transactionHash = TypeConverter.StringHexToByteArray(_transactionHash);
+        byte[] blockHash = TypeConverter.StringHexToByteArray(_blockHash);
+
+        // cast will cause issues after the PoW refactor goes in
+        AionBlockchainImpl chain = (AionBlockchainImpl) this.ac.getAionHub().getBlockchain();
+
+        AionTxInfo info = chain.getTransactionInfoLite(transactionHash, blockHash);
+        if (info == null) {
+            return new RpcMsg(JSONObject.NULL);
+        }
+
+        // ok to getUnchecked() since the load() implementation does not throw checked exceptions
+        AionBlock block = blockCache.getUnchecked(new ByteArrayWrapper(blockHash));
+
+        AionTransaction t = block.getTransactionsList().get(info.getIndex());
+        if (FastByteComparisons.compareTo(t.getHash(), transactionHash) != 0) {
+            LOG.error("INCONSISTENT STATE: transaction info's transaction index is wrong.");
+            return new RpcMsg(null, RpcError.INTERNAL_ERROR, "Database Error");
+        }
+        info.setTransaction(t);
+
+        return new RpcMsg((new TxRecpt(block, info, 0L, true)).toJson());
+    }
+
+    public RpcMsg ops_getTransactionReceiptListByBlockHash(Object _params) {
+        String _blockHash;
+        if (_params instanceof JSONArray) {
+            _blockHash = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _blockHash = ((JSONObject) _params).get("blockHash") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        byte[] blockHash = TypeConverter.StringHexToByteArray(_blockHash);
+
+        if (blockHash.length != 32) {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        // ok to getUnchecked() since the load() implementation does not throw checked exceptions
+        AionBlock b;
+        try {
+            b = blockCache.getUnchecked(new ByteArrayWrapper(blockHash));
+        } catch (CacheLoader.InvalidCacheLoadException e) {
+            // Catch errors if send an incorrect tx hash
+            return new RpcMsg(null, RpcError.INVALID_REQUEST, "Invalid Request");
+        }
+
+        // cast will cause issues after the PoW refactor goes in
+        AionBlockchainImpl chain = (AionBlockchainImpl) this.ac.getAionHub().getBlockchain();
+
+        Function<AionTransaction, JSONObject> extractTxReceipt = t -> {
+            AionTxInfo info = chain.getTransactionInfoLite(t.getHash(), b.getHash());
+            info.setTransaction(t);
+            return ((new TxRecpt(b, info, 0L, true)).toJson());
+        };
+
+        List<JSONObject> receipts;
+        // use the fork-join pool to parallelize receipt retrieval if necessary
+        int PARALLELIZE_RECEIPT_COUNT = 20;
+        if (b.getTransactionsList().size() > PARALLELIZE_RECEIPT_COUNT) {
+            receipts = b.getTransactionsList().parallelStream().map(extractTxReceipt)
+                .collect(toList());
+        } else {
+            receipts = b.getTransactionsList().stream().map(extractTxReceipt).collect(toList());
+        }
+
+        return new RpcMsg(new JSONArray(receipts));
+    }
+
+    public RpcMsg stratum_getinfo() {
+        JSONObject obj = new JSONObject();
+
+        obj.put("balance", 0);
+        obj.put("blocks", 0);
+        obj.put("connections", peerCount());
+        obj.put("proxy", "");
+        obj.put("generate", true);
+        obj.put("genproclimit", 100);
+        obj.put("difficulty", 0);
+
+        return new RpcMsg(obj);
+    }
+
+    public RpcMsg stratum_getwork() {
+        // TODO: Change this to a synchronized map implementation mapping
+
+        if (isSeedMode) {
+            return new RpcMsg(null, RpcError.NOT_ALLOWED, "SeedNodeIsOpened");
+        }
+
+        BlockContext bestBlock = getBlockTemplate();
+        ByteArrayWrapper key = new ByteArrayWrapper(bestBlock.block.getHeader().getMineHash());
+
+        // Read template map; if block already contained chain has not moved forward, simply return
+        // the same block.
+        boolean isContained = false;
+        try {
+            templateMapLock.readLock().lock();
+            if (templateMap.containsKey(key)) {
+                isContained = true;
+            }
+        } finally {
+            templateMapLock.readLock().unlock();
+        }
+
+        // Template not present in map; add it before returning
+        if (!isContained) {
+            try {
+                templateMapLock.writeLock().lock();
+
+                // Deep copy best block to avoid modifying internal best blocks
+                bestBlock = new BlockContext(bestBlock);
+
+                if (!templateMap.keySet().isEmpty()) {
+                    if (templateMap.get(templateMap.keySet().iterator().next()).getNumber()
+                        < bestBlock.block.getNumber()) {
+                        // Found a higher block, clear any remaining cached entries and start on new
+                        // height
+                        templateMap.clear();
+                    }
+                }
+                templateMap.put(key, bestBlock.block);
+
+            } finally {
+                templateMapLock.writeLock().unlock();
+            }
+        }
+
+        JSONObject obj = new JSONObject();
+        obj.put("previousblockhash", toHexString(bestBlock.block.getParentHash()));
+        obj.put("height", bestBlock.block.getNumber());
+        obj.put("target", toHexString(bestBlock.block.getHeader().getPowBoundary()));
+        obj.put("headerHash", toHexString(bestBlock.block.getHeader().getMineHash()));
+        obj.put("blockBaseReward", toHexString(bestBlock.baseBlockReward.toByteArray()));
+        obj.put("blockTxFee", toHexString(bestBlock.transactionFee.toByteArray()));
+
+        return new RpcMsg(obj);
+    }
+
+    public RpcMsg stratum_dumpprivkey() {
+        return new RpcMsg("");
+    }
+
+    /* -------------------------------------------------------------------------
+     * stratum pool
+     */
+
+    public RpcMsg stratum_validateaddress(Object _params) {
+        /*
+         * "isvalid" : true|false, (boolean) If the address is valid or not.
+         * "address", (string) The aion address validated to ensure address is valid
+         * address "ismine" : true|false, (boolean) If the address is contained in the keystore.
+         */
+        String _address;
+        if (_params instanceof JSONArray) {
+            _address = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _address = ((JSONObject) _params).get("address") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        JSONObject obj = new JSONObject();
+
+        obj.put("isvalid", Utils.isValidAddress(_address));
+        obj.put("address", _address + "");
+        obj.put("ismine", Keystore.exist(_address));
+        return new RpcMsg(obj);
+    }
+
+    public RpcMsg stratum_getdifficulty() {
+        /*
+         * Return the highest known difficulty
+         */
+        return new RpcMsg(getBestBlock().getDifficultyBI().toString(16));
+    }
+
+    public RpcMsg stratum_getmininginfo() {
+        AionBlock bestBlock = getBestBlock();
+
+        JSONObject obj = new JSONObject();
+        obj.put("blocks", bestBlock.getNumber());
+        obj.put("currentblocksize", bestBlock.size());
+        obj.put("currentblocktx", bestBlock.getTransactionsList().size());
+        obj.put("difficulty", bestBlock.getDifficultyBI().toString(16));
+        obj.put("testnet", true);
+
+        return new RpcMsg(obj);
+    }
+
+    public RpcMsg stratum_submitblock(Object _params) {
+        Object nce;
+        Object soln;
+        Object hdrHash;
+        if (_params instanceof JSONArray) {
+            nce = ((JSONArray) _params).opt(0);
+            soln = ((JSONArray) _params).opt(1);
+            hdrHash = ((JSONArray) _params).opt(2);
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        JSONObject obj = new JSONObject();
+
+        if (!JSONObject.NULL.equals(nce) && !JSONObject.NULL.equals(soln) && !JSONObject.NULL
+            .equals(hdrHash)) {
+            try {
+                templateMapLock.writeLock().lock();
+
+                ByteArrayWrapper key = new ByteArrayWrapper(hexStringToBytes((String) hdrHash));
+
+                // Grab copy of best block
+                AionBlock bestBlock = templateMap.get(key);
+                if (bestBlock != null) {
+                    bestBlock.getHeader().setSolution(hexStringToBytes(soln + ""));
+                    bestBlock.getHeader().setNonce(hexStringToBytes(nce + ""));
+
+                    // Directly submit to chain for new due to delays using event, explore event
+                    // submission again
+                    ImportResult importResult = AionImpl.inst().addNewMinedBlock(bestBlock);
+                    if (importResult.isSuccessful()) {
+                        templateMap.remove(key);
+                        LOG.info(
+                            "block submitted via api <num={}, hash={}, diff={}, tx={}>",
+                            bestBlock.getNumber(),
+                            bestBlock.getShortHash(), // LogUtil.toHexF8(newBlock.getHash()),
+                            bestBlock.getHeader().getDifficultyBI().toString(),
+                            bestBlock.getTransactionsList().size());
+                    } else {
+                        LOG.info(
+                            "Unable to submit block via api <num={}, hash={}, diff={}, tx={}>",
+                            bestBlock.getNumber(),
+                            bestBlock.getShortHash(), // LogUtil.toHexF8(newBlock.getHash()),
+                            bestBlock.getHeader().getDifficultyBI().toString(),
+                            bestBlock.getTransactionsList().size());
+                    }
+                }
+            } finally {
+                templateMapLock.writeLock().unlock();
+            }
+
+            // TODO: Simplified response for now, need to provide better feedback to caller in next
+            // update
+            obj.put("result", true);
+        } else {
+            obj.put("message", "success");
+            obj.put("code", -1);
+        }
+
+        return new RpcMsg(obj);
+    }
+
+    public RpcMsg stratum_getHeaderByBlockNumber(Object _params) {
+        Object _blockNum;
+        if (_params instanceof JSONArray) {
+            _blockNum = ((JSONArray) _params).opt(0);
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        JSONObject obj = new JSONObject();
+
+        if (!JSONObject.NULL.equals(_blockNum)) {
+            String bnStr = _blockNum + "";
+            try {
+                int bnInt = Integer.decode(bnStr);
+                AionBlock block = getBlockRaw(bnInt);
+                if (block != null) {
+                    A0BlockHeader header = block.getHeader();
+                    obj.put("code", 0); // 0 = success
+                    obj.put("nonce", toHexString(header.getNonce()));
+                    obj.put("solution", toHexString(header.getSolution()));
+                    obj.put("headerHash", toHexString(header.getMineHash()));
+                    obj.putOpt("blockHeader", header.toJSON());
+                } else {
+                    obj.put("message", "Fail - Unable to find block" + bnStr);
+                    obj.put("code", -2);
+                }
+            } catch (Exception e) {
+                obj.put("message", bnStr + " must be an integer value");
+                obj.put("code", -3);
+            }
+        } else {
+            obj.put("message", "Missing block number");
+            obj.put("code", -1);
+        }
+
+        return new RpcMsg(obj);
+    }
+
+    public RpcMsg stratum_getMinerStats(Object _params) {
+        String _address;
+        if (_params instanceof JSONArray) {
+            _address = ((JSONArray) _params).get(0) + "";
+        } else if (_params instanceof JSONObject) {
+            _address = ((JSONObject) _params).get("address") + "";
+        } else {
+            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
+        }
+
+        try {
+            MinerStatsView v = MinerStats.get(_address);
+            return new RpcMsg(v.getResponse());
+        } catch (Exception e) {
+            LOG.error("<rpc-server - cannot get cached response for stratum_getMinerStats: ", e);
+            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Cached response retrieve failed.");
+        }
+    }
+
+    // potential bug introduced by .getSnapshotTo()
+    // comment out until resolved
+    private IRepository getRepoByJsonBlockId(String _bnOrId) {
+        Long bn = parseBnOrId(_bnOrId);
+        // if you passed in an invalid bnOrId, pending or it's an error
+        if (bn == null || bn < 0) {
+            return null;
+        }
+
+        AionBlock b = this.ac.getBlockchain().getBlockByNumber(bn);
+        if (b == null) {
+            return null;
+        }
+
+        return ac.getRepository().getSnapshotTo(b.getStateRoot());
+    }
+
+    private Long parseBnOrId(String _bnOrId) {
+        if (_bnOrId == null) {
+            return null;
+        }
+
+        try {
+            if ("earliest".equalsIgnoreCase(_bnOrId)) {
+                return 0L;
+            } else if ("latest".equalsIgnoreCase(_bnOrId)) {
+                return getBestBlock().getNumber();
+            } else if ("pending".equalsIgnoreCase(_bnOrId)) {
+                return -1L;
+            } else {
+                if (_bnOrId.startsWith("0x")) {
+                    return TypeConverter.StringHexToBigInteger(_bnOrId).longValue();
+                } else {
+                    return Long.parseLong(_bnOrId);
+                }
+            }
+        } catch (Exception e) {
+            LOG.debug("err on parsing block number #" + _bnOrId);
+            return null;
+        }
+    }
+
+    public void shutdown() {
+        if (isFilterEnabled) {
+            shutDownES();
+        }
+    }
+
+    private enum CachedResponseType {
+        CHAIN_HEAD
+    }
+
     // always gets the latest 20 blocks and transactions
     private class ChainHeadView {
+
         LinkedList<byte[]> hashQueue; // more precisely a dequeue
         Map<byte[], JSONObject> blkList;
         Map<byte[], AionBlock> blkObjList;
@@ -1728,7 +2434,8 @@ public class ApiWeb3Aion extends ApiAion {
         }
 
         private JSONObject getJson(AionBlock _b) {
-            BigInteger totalDiff = ac.getAionHub().getBlockStore().getTotalDifficultyForHash(_b.getHash());
+            BigInteger totalDiff = ac.getAionHub().getBlockStore()
+                .getTotalDifficultyForHash(_b.getHash());
             return Blk.AionBlockOnlyToJson(_b, totalDiff);
         }
 
@@ -1790,22 +2497,22 @@ public class ApiWeb3Aion extends ApiAion {
                 lastBlkTimestamp = b.getTimestamp();
 
                 difficultyAccumulator =
-                        difficultyAccumulator.add(new BigInteger(b.getDifficulty()));
+                    difficultyAccumulator.add(new BigInteger(b.getDifficulty()));
                 lastDifficulty = new BigInteger(b.getDifficulty());
 
                 nrgConsumedAccumulator =
-                        nrgConsumedAccumulator.add(
-                                new BigInteger(Long.toString(b.getNrgConsumed())));
+                    nrgConsumedAccumulator.add(
+                        new BigInteger(Long.toString(b.getNrgConsumed())));
                 nrgLimitAccumulator =
-                        nrgLimitAccumulator.add(new BigInteger(Long.toString(b.getNrgLimit())));
+                    nrgLimitAccumulator.add(new BigInteger(Long.toString(b.getNrgLimit())));
                 txnCount += b.getTransactionsList().size();
             }
 
             BigInteger lastBlkReward =
-                    ((AionBlockchainImpl) ac.getBlockchain())
-                            .getChainConfiguration()
-                            .getRewardsCalculator()
-                            .calculateReward(b.getHeader());
+                ((AionBlockchainImpl) ac.getBlockchain())
+                    .getChainConfiguration()
+                    .getRewardsCalculator()
+                    .calculateReward(b.getHeader());
 
             double blkTime = 0;
             double hashRate = 0;
@@ -1871,7 +2578,7 @@ public class ApiWeb3Aion extends ApiAion {
 
             // evict data as necessary
             LinkedList<Map.Entry<byte[], Map.Entry<AionBlock, JSONObject>>> tempStack =
-                    new LinkedList<>();
+                new LinkedList<>();
             tempStack.push(Map.entry(blk.getHash(), Map.entry(blk, getJson(blk))));
             int itr = 1; // deliberately 1, since we've already added the 0th element to the stack
 
@@ -1887,9 +2594,9 @@ public class ApiWeb3Aion extends ApiAion {
                     " blkHash: " + TypeConverter.toJsonHex(blk.getHash()));
             */
 
-            while(!FastByteComparisons.equal(hashQueue.peekFirst(), blk.getParentHash())
-                    && itr < qSize
-                    && blk.getNumber() > 2) {
+            while (!FastByteComparisons.equal(hashQueue.peekFirst(), blk.getParentHash())
+                && itr < qSize
+                && blk.getNumber() > 2) {
 
                 blk = getBlockByHash(blk.getParentHash());
                 tempStack.push(Map.entry(blk.getHash(), Map.entry(blk, getJson(blk))));
@@ -1947,7 +2654,12 @@ public class ApiWeb3Aion extends ApiAion {
         }
     }
 
+    // --------------------------------------------------------------------
+    // Helper Functions
+    // --------------------------------------------------------------------
+
     public class CacheUpdateThreadFactory implements ThreadFactory {
+
         private final AtomicInteger tnum = new AtomicInteger(1);
 
         @Override
@@ -1958,519 +2670,9 @@ public class ApiWeb3Aion extends ApiAion {
         }
     }
 
-    private enum CachedResponseType {
-        CHAIN_HEAD
-    }
-
-    public RpcMsg ops_getChainHeadView() {
-        try {
-            ChainHeadView v = CachedRecentEntities.get(CachedResponseType.CHAIN_HEAD.ordinal());
-            return new RpcMsg(v.getResponse());
-        } catch (Exception e) {
-            LOG.error("<rpc-server - cannot get cached response for ops_getChainHeadView: ", e);
-            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Cached response retrieve failed.");
-        }
-    }
-
-    public RpcMsg ops_getChainHeadViewBestBlock() {
-        try {
-            ChainHeadView v = CachedRecentEntities.get(CachedResponseType.CHAIN_HEAD.ordinal());
-            return new RpcMsg(v.getViewBestBlock());
-        } catch (Exception e) {
-            LOG.error("<rpc-server - cannot get cached response for ops_getChainHeadView: ", e);
-            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Cached response retrieve failed.");
-        }
-    }
-
-    // use a custom implementation to get a receipt with 2 db reads and a constant time op, as opposed to
-    // the getTransactionReceipt() in parent, which computes cumulativeNrg computatio for spec compliance
-    public RpcMsg ops_getTransaction(Object _params) {
-        String _hash;
-        if (_params instanceof JSONArray) {
-            _hash = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _hash = ((JSONObject) _params).get("hash") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] txHash = TypeConverter.StringHexToByteArray(_hash);
-
-        if (txHash == null) return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-
-        AionTxInfo txInfo = this.ac.getAionHub().getBlockchain().getTransactionInfo(txHash);
-
-        if (txInfo == null) return new RpcMsg(JSONObject.NULL);
-
-        AionBlock block =
-                this.ac.getAionHub().getBlockchain().getBlockByHash(txInfo.getBlockHash());
-
-        if (block == null) return new RpcMsg(JSONObject.NULL);
-
-        AionTransaction tx = txInfo.getReceipt().getTransaction();
-
-        if (tx == null) return new RpcMsg(JSONObject.NULL);
-
-        JSONObject result = new JSONObject();
-        result.put("timestampVal", block.getTimestamp());
-        result.put("transactionHash", TypeConverter.toJsonHex(tx.getHash()));
-        result.put("blockNumber", block.getNumber());
-        result.put("blockHash", TypeConverter.toJsonHex(block.getHash()));
-        result.put("nonce", TypeConverter.toJsonHex(tx.getNonce()));
-        result.put("fromAddr", TypeConverter.toJsonHex(tx.getFrom().toBytes()));
-        result.put("toAddr", TypeConverter.toJsonHex(tx.getTo().toBytes()));
-        result.put("value", TypeConverter.toJsonHex(tx.getValue()));
-        result.put("nrgPrice", tx.getNrgPrice());
-        result.put("nrgConsumed", txInfo.getReceipt().getEnergyUsed());
-        result.put("data", TypeConverter.toJsonHex(tx.getData()));
-        result.put("transactionIndex", txInfo.getIndex());
-
-        JSONArray logs = new JSONArray();
-        for (Log l : txInfo.getReceipt().getLogInfoList()) {
-            JSONObject log = new JSONObject();
-            log.put("address", l.getAddress().toString());
-            log.put("data", TypeConverter.toJsonHex(l.getData()));
-            JSONArray topics = new JSONArray();
-            for (byte[] topic : l.getTopics()) {
-                topics.put(TypeConverter.toJsonHex(topic));
-            }
-            log.put("topics", topics);
-            logs.put(log);
-        }
-        result.put("logs", logs);
-
-        return new RpcMsg(result);
-    }
-
-    public RpcMsg ops_getBlock(Object _params) {
-        String _bnOrHash;
-        boolean _fullTx;
-        if (_params instanceof JSONArray) {
-            _bnOrHash = ((JSONArray) _params).get(0) + "";
-            _fullTx = ((JSONArray) _params).optBoolean(1, false);
-        } else if (_params instanceof JSONObject) {
-            _bnOrHash = ((JSONObject) _params).get("block") + "";
-            _fullTx = ((JSONObject) _params).optBoolean("fullTransaction", false);
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        AionBlock block = null;
-
-        Long bn = this.parseBnOrId(_bnOrHash);
-
-        // user passed a Long block number
-        if (bn != null) {
-            if (bn >= 0) {
-                block = this.ac.getBlockchain().getBlockByNumber(bn);
-                if (block == null) return new RpcMsg(JSONObject.NULL);
-            } else {
-                return new RpcMsg(JSONObject.NULL);
-            }
-        }
-
-        // see if the user passed in a hash
-        if (block == null) {
-            block = this.ac.getBlockchain().getBlockByHash(ByteUtil.hexStringToBytes(_bnOrHash));
-            if (block == null) return new RpcMsg(JSONObject.NULL);
-        }
-
-        AionBlock mainBlock = this.ac.getBlockchain().getBlockByNumber(block.getNumber());
-        if (mainBlock == null) return new RpcMsg(JSONObject.NULL);
-
-        if (!FastByteComparisons.equal(block.getHash(), mainBlock.getHash())) {
-            return new RpcMsg(JSONObject.NULL);
-        }
-
-        // ok so now we have a mainchain block
-
-        BigInteger blkReward =
-                ((AionBlockchainImpl) ac.getBlockchain())
-                        .getChainConfiguration()
-                        .getRewardsCalculator()
-                        .calculateReward(block.getHeader());
-        BigInteger totalDiff =
-                this.ac.getAionHub().getBlockStore().getTotalDifficultyForHash(block.getHash());
-
-        JSONObject blk = new JSONObject();
-        blk.put("timestampVal", block.getTimestamp());
-        blk.put("blockNumber", block.getNumber());
-        blk.put("numTransactions", block.getTransactionsList().size());
-
-        blk.put("blockHash", TypeConverter.toJsonHex(block.getHash()));
-        blk.put("parentHash", TypeConverter.toJsonHex(block.getParentHash()));
-        blk.put("minerAddress", TypeConverter.toJsonHex(block.getCoinbase().toBytes()));
-
-        blk.put("receiptTxRoot", TypeConverter.toJsonHex(block.getReceiptsRoot()));
-        blk.put("txTrieRoot", TypeConverter.toJsonHex(block.getTxTrieRoot()));
-        blk.put("stateRoot", TypeConverter.toJsonHex(block.getStateRoot()));
-
-        blk.put("difficulty", TypeConverter.toJsonHex(block.getDifficulty()));
-        blk.put("totalDifficulty", totalDiff.toString(16));
-        blk.put("nonce", TypeConverter.toJsonHex(block.getNonce()));
-
-        blk.put("blockReward", blkReward);
-        blk.put("nrgConsumed", block.getNrgConsumed());
-        blk.put("nrgLimit", block.getNrgLimit());
-
-        blk.put("size", block.size());
-        blk.put("bloom", TypeConverter.toJsonHex(block.getLogBloom()));
-        blk.put("extraData", TypeConverter.toJsonHex(block.getExtraData()));
-        blk.put("solution", TypeConverter.toJsonHex(block.getHeader().getSolution()));
-
-        JSONObject result = new JSONObject();
-        result.put("blk", blk);
-
-        if (_fullTx) {
-            JSONArray txn = new JSONArray();
-            for (AionTransaction tx : block.getTransactionsList()) {
-                // transactionHash, fromAddr, toAddr, value, timestampVal, blockNumber, blockHash
-                JSONArray t = new JSONArray();
-                t.put(TypeConverter.toJsonHex(tx.getHash()));
-                t.put(TypeConverter.toJsonHex(tx.getFrom().toBytes()));
-                t.put(TypeConverter.toJsonHex(tx.getTo().toBytes()));
-                t.put(TypeConverter.toJsonHex(tx.getValue()));
-                t.put(block.getTimestamp());
-                t.put(block.getNumber());
-
-                txn.put(t);
-            }
-            result.put("txn", txn);
-        }
-
-        return new RpcMsg(result);
-    }
-
-    /**
-     * This function runs in ~ 30ms
-     * Is an order of magnitude slower than ops_getTransactionReceiptByTransactionAndBlockHash
-     */
-    public RpcMsg ops_getTransactionReceiptByTransactionHash(Object _params) {
-        String _transactionHash;
-        if (_params instanceof JSONArray) {
-            _transactionHash = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _transactionHash = ((JSONObject) _params).get("transactionHash") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] transactionHash = TypeConverter.StringHexToByteArray(_transactionHash);
-
-        AionTxInfo info = this.ac.getAionHub().getBlockchain().getTransactionInfo(transactionHash);
-        if (info == null) return new RpcMsg(JSONObject.NULL);
-
-        // ok to getUnchecked() since the load() implementation does not throw checked exceptions
-        AionBlock block = blockCache.getUnchecked(new ByteArrayWrapper(info.getBlockHash()));
-
-        return new RpcMsg((new TxRecpt(block, info, 0L, true)).toJson());
-    }
-
-    /**
-     * This function runs as fast as is possible with the on-disk data model
-     * Use this to retrieve the Transaction Receipt if you know the block hash already
-     */
-    public RpcMsg ops_getTransactionReceiptByTransactionAndBlockHash(Object _params) {
-        String _transactionHash;
-        String _blockHash;
-        if (_params instanceof JSONArray) {
-            _transactionHash = ((JSONArray) _params).get(0) + "";
-            _blockHash = ((JSONArray) _params).get(1) + "";
-        } else if (_params instanceof JSONObject) {
-            _transactionHash = ((JSONObject) _params).get("transactionHash") + "";
-            _blockHash = ((JSONObject) _params).get("blockHash") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] transactionHash = TypeConverter.StringHexToByteArray(_transactionHash);
-        byte[] blockHash = TypeConverter.StringHexToByteArray(_blockHash);
-
-        // cast will cause issues after the PoW refactor goes in
-        AionBlockchainImpl chain = (AionBlockchainImpl) this.ac.getAionHub().getBlockchain();
-
-        AionTxInfo info = chain.getTransactionInfoLite(transactionHash, blockHash);
-        if (info == null) return new RpcMsg(JSONObject.NULL);
-
-        // ok to getUnchecked() since the load() implementation does not throw checked exceptions
-        AionBlock block = blockCache.getUnchecked(new ByteArrayWrapper(blockHash));
-
-        AionTransaction t = block.getTransactionsList().get(info.getIndex());
-        if (FastByteComparisons.compareTo(t.getHash(), transactionHash) != 0) {
-            LOG.error("INCONSISTENT STATE: transaction info's transaction index is wrong.");
-            return new RpcMsg(null, RpcError.INTERNAL_ERROR, "Database Error");
-        }
-        info.setTransaction(t);
-
-        return new RpcMsg((new TxRecpt(block, info, 0L, true)).toJson());
-    }
-
-    public RpcMsg ops_getTransactionReceiptListByBlockHash(Object _params) {
-        String _blockHash;
-        if (_params instanceof JSONArray) {
-            _blockHash = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _blockHash = ((JSONObject) _params).get("blockHash") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        byte[] blockHash = TypeConverter.StringHexToByteArray(_blockHash);
-
-        if (blockHash.length != 32)
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-
-        // ok to getUnchecked() since the load() implementation does not throw checked exceptions
-        AionBlock b;
-        try {
-             b = blockCache.getUnchecked(new ByteArrayWrapper(blockHash));
-        } catch (CacheLoader.InvalidCacheLoadException e) {
-            // Catch errors if send an incorrect tx hash
-            return new RpcMsg(null, RpcError.INVALID_REQUEST, "Invalid Request");
-        }
-
-        // cast will cause issues after the PoW refactor goes in
-        AionBlockchainImpl chain = (AionBlockchainImpl) this.ac.getAionHub().getBlockchain();
-
-        Function<AionTransaction, JSONObject> extractTxReceipt = t -> {
-            AionTxInfo info = chain.getTransactionInfoLite(t.getHash(), b.getHash());
-            info.setTransaction(t);
-            return((new TxRecpt(b, info, 0L, true)).toJson());
-        };
-
-        List<JSONObject> receipts;
-        // use the fork-join pool to parallelize receipt retrieval if necessary
-        int PARALLELIZE_RECEIPT_COUNT = 20;
-        if (b.getTransactionsList().size() > PARALLELIZE_RECEIPT_COUNT)
-            receipts = b.getTransactionsList().parallelStream().map(extractTxReceipt).collect(toList());
-        else
-            receipts = b.getTransactionsList().stream().map(extractTxReceipt).collect(toList());
-
-        return new RpcMsg(new JSONArray(receipts));
-    }
-
-    /* -------------------------------------------------------------------------
-     * stratum pool
-     */
-
-    public RpcMsg stratum_getinfo() {
-        JSONObject obj = new JSONObject();
-
-        obj.put("balance", 0);
-        obj.put("blocks", 0);
-        obj.put("connections", peerCount());
-        obj.put("proxy", "");
-        obj.put("generate", true);
-        obj.put("genproclimit", 100);
-        obj.put("difficulty", 0);
-
-        return new RpcMsg(obj);
-    }
-
-    public RpcMsg stratum_getwork() {
-        // TODO: Change this to a synchronized map implementation mapping
-
-        if (isSeedMode) {
-            return new RpcMsg(null, RpcError.NOT_ALLOWED, "SeedNodeIsOpened");
-        }
-
-        BlockContext bestBlock = getBlockTemplate();
-        ByteArrayWrapper key = new ByteArrayWrapper(bestBlock.block.getHeader().getMineHash());
-
-        // Read template map; if block already contained chain has not moved forward, simply return
-        // the same block.
-        boolean isContained = false;
-        try {
-            templateMapLock.readLock().lock();
-            if (templateMap.containsKey(key)) {
-                isContained = true;
-            }
-        } finally {
-            templateMapLock.readLock().unlock();
-        }
-
-        // Template not present in map; add it before returning
-        if (!isContained) {
-            try {
-                templateMapLock.writeLock().lock();
-
-                // Deep copy best block to avoid modifying internal best blocks
-                bestBlock = new BlockContext(bestBlock);
-
-                if (!templateMap.keySet().isEmpty()) {
-                    if (templateMap.get(templateMap.keySet().iterator().next()).getNumber()
-                            < bestBlock.block.getNumber()) {
-                        // Found a higher block, clear any remaining cached entries and start on new
-                        // height
-                        templateMap.clear();
-                    }
-                }
-                templateMap.put(key, bestBlock.block);
-
-            } finally {
-                templateMapLock.writeLock().unlock();
-            }
-        }
-
-        JSONObject obj = new JSONObject();
-        obj.put("previousblockhash", toHexString(bestBlock.block.getParentHash()));
-        obj.put("height", bestBlock.block.getNumber());
-        obj.put("target", toHexString(bestBlock.block.getHeader().getPowBoundary()));
-        obj.put("headerHash", toHexString(bestBlock.block.getHeader().getMineHash()));
-        obj.put("blockBaseReward", toHexString(bestBlock.baseBlockReward.toByteArray()));
-        obj.put("blockTxFee", toHexString(bestBlock.transactionFee.toByteArray()));
-
-        return new RpcMsg(obj);
-    }
-
-    public RpcMsg stratum_dumpprivkey() {
-        return new RpcMsg("");
-    }
-
-    public RpcMsg stratum_validateaddress(Object _params) {
-        /*
-         * "isvalid" : true|false, (boolean) If the address is valid or not.
-         * "address", (string) The aion address validated to ensure address is valid
-         * address "ismine" : true|false, (boolean) If the address is contained in the keystore.
-         */
-        String _address;
-        if (_params instanceof JSONArray) {
-            _address = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _address = ((JSONObject) _params).get("address") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        JSONObject obj = new JSONObject();
-
-        obj.put("isvalid", Utils.isValidAddress(_address));
-        obj.put("address", _address + "");
-        obj.put("ismine", Keystore.exist(_address));
-        return new RpcMsg(obj);
-    }
-
-    public RpcMsg stratum_getdifficulty() {
-        /*
-         * Return the highest known difficulty
-         */
-        return new RpcMsg(getBestBlock().getDifficultyBI().toString(16));
-    }
-
-    public RpcMsg stratum_getmininginfo() {
-        AionBlock bestBlock = getBestBlock();
-
-        JSONObject obj = new JSONObject();
-        obj.put("blocks", bestBlock.getNumber());
-        obj.put("currentblocksize", bestBlock.size());
-        obj.put("currentblocktx", bestBlock.getTransactionsList().size());
-        obj.put("difficulty", bestBlock.getDifficultyBI().toString(16));
-        obj.put("testnet", true);
-
-        return new RpcMsg(obj);
-    }
-
-    public RpcMsg stratum_submitblock(Object _params) {
-        Object nce;
-        Object soln;
-        Object hdrHash;
-        if (_params instanceof JSONArray) {
-            nce = ((JSONArray) _params).opt(0);
-            soln = ((JSONArray) _params).opt(1);
-            hdrHash = ((JSONArray) _params).opt(2);
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        JSONObject obj = new JSONObject();
-
-        if (!JSONObject.NULL.equals(nce) && !JSONObject.NULL.equals(soln) && !JSONObject.NULL.equals(hdrHash)) {
-            try {
-                templateMapLock.writeLock().lock();
-
-                ByteArrayWrapper key = new ByteArrayWrapper(hexStringToBytes((String) hdrHash));
-
-                // Grab copy of best block
-                AionBlock bestBlock = templateMap.get(key);
-                if (bestBlock != null) {
-                    bestBlock.getHeader().setSolution(hexStringToBytes(soln + ""));
-                    bestBlock.getHeader().setNonce(hexStringToBytes(nce + ""));
-
-                    // Directly submit to chain for new due to delays using event, explore event
-                    // submission again
-                    ImportResult importResult = AionImpl.inst().addNewMinedBlock(bestBlock);
-                    if (importResult.isSuccessful()) {
-                        templateMap.remove(key);
-                        LOG.info(
-                                "block submitted via api <num={}, hash={}, diff={}, tx={}>",
-                                bestBlock.getNumber(),
-                                bestBlock.getShortHash(), // LogUtil.toHexF8(newBlock.getHash()),
-                                bestBlock.getHeader().getDifficultyBI().toString(),
-                                bestBlock.getTransactionsList().size());
-                    } else {
-                        LOG.info(
-                                "Unable to submit block via api <num={}, hash={}, diff={}, tx={}>",
-                                bestBlock.getNumber(),
-                                bestBlock.getShortHash(), // LogUtil.toHexF8(newBlock.getHash()),
-                                bestBlock.getHeader().getDifficultyBI().toString(),
-                                bestBlock.getTransactionsList().size());
-                    }
-                }
-            } finally {
-                templateMapLock.writeLock().unlock();
-            }
-
-            // TODO: Simplified response for now, need to provide better feedback to caller in next
-            // update
-            obj.put("result", true);
-        } else {
-            obj.put("message", "success");
-            obj.put("code", -1);
-        }
-
-        return new RpcMsg(obj);
-    }
-
-    public RpcMsg stratum_getHeaderByBlockNumber(Object _params) {
-        Object _blockNum;
-        if (_params instanceof JSONArray) {
-            _blockNum = ((JSONArray) _params).opt(0);
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        JSONObject obj = new JSONObject();
-
-        if (!JSONObject.NULL.equals(_blockNum)) {
-            String bnStr = _blockNum + "";
-            try {
-                int bnInt = Integer.decode(bnStr);
-                AionBlock block = getBlockRaw(bnInt);
-                if (block != null) {
-                    A0BlockHeader header = block.getHeader();
-                    obj.put("code", 0); // 0 = success
-                    obj.put("nonce", toHexString(header.getNonce()));
-                    obj.put("solution", toHexString(header.getSolution()));
-                    obj.put("headerHash", toHexString(header.getMineHash()));
-                    obj.putOpt("blockHeader", header.toJSON());
-                } else {
-                    obj.put("message", "Fail - Unable to find block" + bnStr);
-                    obj.put("code", -2);
-                }
-            } catch (Exception e) {
-                obj.put("message", bnStr + " must be an integer value");
-                obj.put("code", -3);
-            }
-        } else {
-            obj.put("message", "Missing block number");
-            obj.put("code", -1);
-        }
-
-        return new RpcMsg(obj);
-    }
-
     // always gets the latest 20 blocks and transactions
     private class MinerStatsView {
+
         LinkedList<byte[]> hashQueue; // more precisely a dequeue
         Map<byte[], AionBlock> blocks;
         private JSONObject response;
@@ -2516,7 +2718,9 @@ public class ApiWeb3Aion extends ApiAion {
                     byte[] hash = (byte[]) li.next();
                     b = blocks.get(hash);
 
-                    if (i == 0) lastDifficulty = b.getDifficultyBI();
+                    if (i == 0) {
+                        lastDifficulty = b.getDifficultyBI();
+                    }
 
                     // only accumulate block times over the last 32 blocks
                     if (i <= STRATUM_BLKTIME_INCLUDED_COUNT) {
@@ -2543,8 +2747,8 @@ public class ApiWeb3Aion extends ApiAion {
 
                 if (blkTime > 0) {
                     networkHashrate =
-                            (new BigDecimal(lastDifficulty))
-                                    .divide(BigDecimal.valueOf(blkTime), 4, RoundingMode.HALF_UP);
+                        (new BigDecimal(lastDifficulty))
+                            .divide(BigDecimal.valueOf(blkTime), 4, RoundingMode.HALF_UP);
                 }
 
                 if (i > 0) {
@@ -2568,7 +2772,9 @@ public class ApiWeb3Aion extends ApiAion {
             // get the latest head
             AionBlock blk = getBestBlock();
 
-            if (blk == null) return this;
+            if (blk == null) {
+                return this;
+            }
 
             if (FastByteComparisons.equal(hashQueue.peekFirst(), blk.getHash())) {
                 return this; // nothing to do
@@ -2591,9 +2797,9 @@ public class ApiWeb3Aion extends ApiAion {
                     " blkHash: " + TypeConverter.toJsonHex(blk.getHash()));
             */
 
-            while(!FastByteComparisons.equal(hashQueue.peekFirst(), blk.getParentHash())
-                    && itr < qSize
-                    && blk.getNumber() > 2) {
+            while (!FastByteComparisons.equal(hashQueue.peekFirst(), blk.getParentHash())
+                && itr < qSize
+                && blk.getNumber() > 2) {
 
                 blk = getBlockByHash(blk.getParentHash());
                 tempStack.push(Map.entry(blk.getHash(), blk));
@@ -2642,6 +2848,7 @@ public class ApiWeb3Aion extends ApiAion {
     }
 
     public class MinerStatsThreadFactory implements ThreadFactory {
+
         private final AtomicInteger tnum = new AtomicInteger(1);
 
         @Override
@@ -2650,68 +2857,5 @@ public class ApiWeb3Aion extends ApiAion {
             t.setPriority(Thread.MIN_PRIORITY);
             return t;
         }
-    }
-
-    public RpcMsg stratum_getMinerStats(Object _params) {
-        String _address;
-        if (_params instanceof JSONArray) {
-            _address = ((JSONArray) _params).get(0) + "";
-        } else if (_params instanceof JSONObject) {
-            _address = ((JSONObject) _params).get("address") + "";
-        } else {
-            return new RpcMsg(null, RpcError.INVALID_PARAMS, "Invalid parameters");
-        }
-
-        try {
-            MinerStatsView v = MinerStats.get(_address);
-            return new RpcMsg(v.getResponse());
-        } catch (Exception e) {
-            LOG.error("<rpc-server - cannot get cached response for stratum_getMinerStats: ", e);
-            return new RpcMsg(null, RpcError.EXECUTION_ERROR, "Cached response retrieve failed.");
-        }
-    }
-
-    // --------------------------------------------------------------------
-    // Helper Functions
-    // --------------------------------------------------------------------
-
-    // potential bug introduced by .getSnapshotTo()
-    // comment out until resolved
-    private IRepository getRepoByJsonBlockId(String _bnOrId) {
-        Long bn = parseBnOrId(_bnOrId);
-        // if you passed in an invalid bnOrId, pending or it's an error
-        if (bn == null || bn < 0) return null;
-
-        AionBlock b = this.ac.getBlockchain().getBlockByNumber(bn);
-        if (b == null) return null;
-
-        return ac.getRepository().getSnapshotTo(b.getStateRoot());
-    }
-
-    private Long parseBnOrId(String _bnOrId) {
-        if (_bnOrId == null) return null;
-
-        try {
-            if ("earliest".equalsIgnoreCase(_bnOrId)) {
-                return 0L;
-            } else if ("latest".equalsIgnoreCase(_bnOrId)) {
-                return getBestBlock().getNumber();
-            } else if ("pending".equalsIgnoreCase(_bnOrId)) {
-                return -1L;
-            } else {
-                if (_bnOrId.startsWith("0x")) {
-                    return TypeConverter.StringHexToBigInteger(_bnOrId).longValue();
-                } else {
-                    return Long.parseLong(_bnOrId);
-                }
-            }
-        } catch (Exception e) {
-            LOG.debug("err on parsing block number #" + _bnOrId);
-            return null;
-        }
-    }
-
-    public void shutdown() {
-        if (isFilterEnabled) shutDownES();
     }
 }
